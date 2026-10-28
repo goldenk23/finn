@@ -1,0 +1,29 @@
+# Secrets & Environment
+.env
+.env.*
+!.env.example
+
+# SQLite Databases & WAL files
+*.db
+*.db-shm
+*.db-wal
+*.sqlite*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+
+# PDF & Scraper Caches
+backend/cache_pdfs/
+
+# Next.js / Node
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+next-env.d.ts
