@@ -612,6 +612,133 @@ export function PullTab({
             </div>
           </div>
 
+          {/* UPPER HERO SPOTLIGHT: PRIMARY-SOURCE COPILOT COMMAND DECK */}
+          <div className="relative overflow-hidden rounded-xl border-2 border-cyan-500/45 bg-gradient-to-br from-cyan-950/40 via-zinc-900/95 to-emerald-950/25 p-3.5 shadow-lg shadow-cyan-950/25">
+            <div className="flex items-start justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-cyan-500/20 border border-cyan-400/40 text-cyan-300 shadow-inner">
+                  <Sparkles className="w-4 h-4" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-1.5">
+                    <h2 className="text-xs font-extrabold uppercase tracking-wider text-white">
+                      Ask {pullData.ticker} Primary-Source Copilot
+                    </h2>
+                    <span className="inline-flex items-center gap-1 rounded-full bg-cyan-500/20 border border-cyan-400/35 px-1.5 py-0.5 text-[9px] font-mono font-semibold text-cyan-300">
+                      <span className="h-1.5 w-1.5 rounded-full bg-cyan-400 animate-pulse" />
+                      LIVE Q&amp;A
+                    </span>
+                  </div>
+                  <p className="text-[10.5px] text-zinc-300 mt-0.5">
+                    Interrogate 10Y financials, quarterly tables &amp; concall transcripts with exact citations
+                  </p>
+                </div>
+              </div>
+              <span className="shrink-0 rounded bg-zinc-950/90 border border-zinc-800 px-1.5 py-0.5 text-[9px] font-mono text-cyan-300">
+                Tier 2 • Flash
+              </span>
+            </div>
+
+            {/* Command Input Bar */}
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                handleAskQuestion(question);
+              }}
+              className="mt-3 flex items-center gap-2"
+            >
+              <input
+                type="text"
+                value={question}
+                onChange={(e) => setQuestion(e.target.value)}
+                placeholder={`Ask ${pullData.ticker} filings (e.g. "What drove OPM & PAT recently?")...`}
+                className="flex-1 rounded-lg border border-cyan-500/35 bg-zinc-950/95 px-3 py-2 text-xs text-white placeholder-zinc-400 focus:border-cyan-400 focus:outline-none shadow-inner"
+              />
+              <button
+                type="submit"
+                disabled={asking || !question.trim()}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-cyan-400 hover:bg-cyan-300 px-3.5 py-2 text-xs font-extrabold text-zinc-950 shadow-sm transition disabled:opacity-50"
+              >
+                {asking ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <span>Auditing...</span>
+                  </>
+                ) : (
+                  <>
+                    <Send className="w-3.5 h-3.5" />
+                    <span>Ask</span>
+                  </>
+                )}
+              </button>
+            </form>
+
+            {/* 1-Tap Institutional Audit Prompts */}
+            <div className="mt-2.5 flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-0.5">
+              <span className="text-[9.5px] font-mono uppercase text-cyan-300/80 shrink-0">
+                1-Tap Audit:
+              </span>
+              {[
+                { label: "OPM & PAT Drivers", q: QUICK_QUESTIONS[0] },
+                { label: "CFO vs PAT & Working Cap", q: QUICK_QUESTIONS[1] },
+                { label: "Capex & Concall Guidance", q: QUICK_QUESTIONS[2] },
+              ].map((preset, i) => (
+                <button
+                  key={i}
+                  type="button"
+                  disabled={asking}
+                  onClick={() => handleAskQuestion(preset.q)}
+                  className="shrink-0 rounded-md border border-cyan-500/30 bg-zinc-950/85 hover:bg-cyan-500/15 hover:border-cyan-400/50 px-2 py-1 text-[10.5px] font-medium text-cyan-200 transition disabled:opacity-50"
+                >
+                  ⚡ {preset.label}
+                </button>
+              ))}
+            </div>
+
+            {qaError && (
+              <div className="mt-2.5 rounded-lg border border-rose-500/35 bg-rose-950/40 px-2.5 py-2 text-xs text-rose-300">
+                {qaError}
+              </div>
+            )}
+
+            {qaHistory.filter((item) => item.ticker === pullData.ticker).length > 0 && (
+              <div className="mt-3 space-y-2 border-t border-cyan-500/25 pt-2.5">
+                {qaHistory
+                  .filter((item) => item.ticker === pullData.ticker)
+                  .map((item, idx) => (
+                    <div
+                      key={idx}
+                      className="rounded-lg border border-cyan-500/30 bg-zinc-950/95 p-3 space-y-2 shadow-inner"
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="text-[11px] font-mono font-semibold text-cyan-300">
+                          Q: {item.question}
+                        </div>
+                        <span className="shrink-0 rounded bg-emerald-500/15 border border-emerald-500/30 px-1.5 py-0.5 text-[9px] font-mono text-emerald-300">
+                          Cited Filing Answer
+                        </span>
+                      </div>
+                      <div className="text-xs text-zinc-100 whitespace-pre-line leading-relaxed">
+                        {item.answer}
+                      </div>
+                      {(item.citations || []).length > 0 && (
+                        <div className="flex flex-wrap gap-1 pt-1.5 border-t border-zinc-800/80">
+                          {item.citations.map((cit, ci) => (
+                            <span
+                              key={ci}
+                              className="rounded bg-zinc-900 border border-cyan-500/25 px-1.5 py-0.5 text-[9.5px] font-mono text-cyan-300"
+                            >
+                              📄 {cit}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+              </div>
+            )}
+          </div>
+
           {/* MODULE 1 (HERO WORKED EXAMPLE): NARRATIVE VS. NUMBERS (4-QUARTER AUDIT) */}
           <div className="rounded-xl border-2 border-emerald-500/35 bg-gradient-to-b from-emerald-950/25 via-zinc-900/95 to-zinc-900/95 p-3.5 shadow-lg">
             <div className="flex items-start justify-between gap-2 pb-2.5 border-b border-zinc-800">
@@ -1012,104 +1139,6 @@ export function PullTab({
                 </ul>
               </div>
             </div>
-          </div>
-
-          {/* PRIMARY-SOURCE COPILOT Q&A */}
-          <div className="rounded-xl border border-cyan-500/35 bg-zinc-900/95 p-3.5 space-y-3">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <Sparkles className="w-4 h-4 text-cyan-400" />
-                <div>
-                  <h2 className="text-xs font-bold uppercase tracking-wider text-white">
-                    Primary-Source Copilot ({pullData.ticker})
-                  </h2>
-                  <p className="text-[10px] text-zinc-400">
-                    Grounded strictly in {pullData.ticker}&apos;s 10Y tables, Concalls &amp; AR
-                  </p>
-                </div>
-              </div>
-              <span className="text-[10px] font-mono text-cyan-400 bg-cyan-500/10 px-1.5 py-0.5 rounded">
-                Tier 2 • Flash
-              </span>
-            </div>
-
-            {/* Quick Prompt Pills */}
-            <div className="flex flex-wrap gap-1.5">
-              {QUICK_QUESTIONS.map((q, i) => (
-                <button
-                  key={i}
-                  type="button"
-                  disabled={asking}
-                  onClick={() => handleAskQuestion(q)}
-                  className="text-left rounded-lg border border-zinc-800 bg-zinc-950/80 hover:border-cyan-500/40 px-2.5 py-1.5 text-[11px] text-zinc-300 transition disabled:opacity-50"
-                >
-                  &ldquo;{q}&rdquo;
-                </button>
-              ))}
-            </div>
-
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                handleAskQuestion(question);
-              }}
-              className="flex items-center gap-2"
-            >
-              <input
-                type="text"
-                value={question}
-                onChange={(e) => setQuestion(e.target.value)}
-                placeholder={`Ask anything about ${pullData.ticker}'s filings...`}
-                className="flex-1 rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-xs text-white placeholder-zinc-500 focus:border-cyan-400 focus:outline-none"
-              />
-              <button
-                type="submit"
-                disabled={asking || !question.trim()}
-                className="inline-flex items-center gap-1 rounded-lg bg-cyan-500 hover:bg-cyan-400 px-3 py-2 text-xs font-bold text-zinc-950 transition disabled:opacity-50"
-              >
-                {asking ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                ) : (
-                  <Send className="w-3.5 h-3.5" />
-                )}
-              </button>
-            </form>
-
-            {qaError && (
-              <div className="text-xs text-rose-400 bg-rose-950/30 p-2 rounded">
-                {qaError}
-              </div>
-            )}
-
-            {qaHistory.length > 0 && (
-              <div className="space-y-2.5 pt-1">
-                {qaHistory.map((item, idx) => (
-                  <div
-                    key={idx}
-                    className="rounded-lg border border-zinc-800 bg-zinc-950 p-3 space-y-2"
-                  >
-                    <div className="text-[11px] font-semibold text-cyan-300">
-                      Q: {item.question}
-                    </div>
-                    <div className="text-xs text-zinc-200 whitespace-pre-line leading-relaxed">
-                      {item.answer}
-                    </div>
-                    {(item.citations || []).length > 0 && (
-                      <div className="flex flex-wrap gap-1 pt-1 border-t border-zinc-800/70">
-                        {item.citations.map((cit, ci) => (
-                          <span
-                            key={ci}
-                            className="rounded bg-zinc-900 border border-zinc-800 px-1.5 py-0.5 text-[9.5px] font-mono text-zinc-400"
-                          >
-                            Source: {cit}
-                          </span>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
           </div>
         </>
       )}
