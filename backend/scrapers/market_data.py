@@ -33,6 +33,8 @@ def fetch_eod_metrics(
             hist = None
             for sym in candidate_symbols:
                 h = yf.Ticker(sym).history(period="1mo", interval="1d", auto_adjust=True)
+                if not h.empty:
+                    h = h.dropna(subset=["Close"])
                 if not h.empty and len(h) >= 2:
                     hist = h
                     break
