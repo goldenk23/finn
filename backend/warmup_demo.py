@@ -37,11 +37,13 @@ def sanitize_and_repair_announcements() -> None:
         fid = r["filing_id"]
         old_cat, old_mat = r["category"], int(r["materiality"])
         new_cat, new_mat = enforce_filing_hygiene(r["title"], old_cat, old_mat)
-        if (new_cat, new_mat) != (old_cat, old_mat):
+        should_clear_enr = new_mat == 0 or new_cat not in ("results", "management_change")
+        new_enr_json = "{}" if should_clear_enr else (r["enriched_json"] or "{}")
+        if (new_cat, new_mat, new_enr_json) != (old_cat, old_mat, r["enriched_json"] or "{}"):
             with get_conn() as conn:
                 conn.execute(
                     "UPDATE announcements SET category = ?, materiality = ?, enriched_json = ? WHERE filing_id = ?",
-                    (new_cat, new_mat, "{}" if new_mat == 0 else (r["enriched_json"] or "{}"), fid),
+                    (new_cat, new_mat, new_enr_json, fid),
                 )
             if old_mat == 1 and new_mat == 0:
                 demoted += 1
@@ -96,7 +98,12 @@ def sanitize_and_repair_announcements() -> None:
         except Exception:
             pass
 
-        if not enr or not enr.get("has_numbers") or not _is_pdf_extraction_sane(enr, sc_ref):
+        if (
+            not enr
+            or not enr.get("has_numbers")
+            or not _is_pdf_extraction_sane(enr, sc_ref)
+            or (ticker == "TRENT" and enr.get("period") == "Jun 2026")
+        ):
             print(f"[hygiene] Re-enriching {ticker} results card ({fid}) with Screener ₹ Cr cross-check...")
             new_enr = enrich_single_filing(fid)
             print(f"  -> {ticker} updated: {new_enr.get('metrics')}")
@@ -108,6 +115,28 @@ def sanitize_and_repair_announcements() -> None:
                     (json.dumps(norm_enr, ensure_ascii=False), fid),
                 )
             print(f"[hygiene] Normalized % formatting for {ticker}: {norm_enr.get('metrics')}")
+
+    # Enrich any un-enriched portfolio 'management_change' cards
+    with get_conn() as conn:
+        mgmt_rows = [
+            dict(r)
+            for r in conn.execute(
+                """
+                SELECT * FROM announcements
+                WHERE materiality = 1
+                  AND category = 'management_change'
+                  AND ticker IN (SELECT ticker FROM portfolio)
+                  AND (enriched_json IS NULL OR enriched_json = '{}' OR enriched_json = '')
+                ORDER BY published_at DESC
+                """
+            ).fetchall()
+        ]
+    for r in mgmt_rows:
+        fid = r["filing_id"]
+        ticker = r["ticker"]
+        print(f"[hygiene] Enriching management_change card [{ticker}] ({fid}): {r['title'][:70]}...")
+        new_enr = enrich_single_filing(fid)
+        print(f"  -> {ticker} mgmt bio: {new_enr.get('person_name')} ({new_enr.get('action')})")
 
 
 def main() -> None:

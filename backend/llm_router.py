@@ -29,7 +29,7 @@ MODEL_PRICING_PER_1M: dict[str, tuple[float, float]] = {
 
 MODEL_FALLBACKS: dict[str, list[str]] = {
     MODEL_FLASH_LITE: [MODEL_FLASH_LITE, MODEL_FLASH],
-    MODEL_FLASH: [MODEL_FLASH],
+    MODEL_FLASH: [MODEL_FLASH, MODEL_FLASH],
     MODEL_PRO: [MODEL_PRO, "gemini-3.1-pro-preview", MODEL_FLASH],
 }
 
@@ -160,7 +160,7 @@ def _call_gemini_json(
             return json.loads(raw_text)
         except Exception as exc:
             last_err = exc
-            if "404" in str(exc) or "NOT_FOUND" in str(exc):
+            if "404" in str(exc) or "NOT_FOUND" in str(exc) or isinstance(exc, json.JSONDecodeError):
                 continue
             raise
     raise RuntimeError(f"All candidate models {candidates} failed: {last_err}")
@@ -348,20 +348,26 @@ def _is_pdf_extraction_sane(pdf_res: dict[str, Any], sc_ref: dict[str, Any] | No
     if rev is None or rev <= 0 or ebitda is None or pat is None:
         return False
 
-    # Implausible margin ratio (<2.5% EBITDA margin or >95% EBITDA margin on large revenue)
-    if abs(ebitda) / rev < 0.025 or abs(ebitda) / rev > 0.95 or abs(pat) / rev < 0.015:
+    # Implausible margin ratio (<2.0% EBITDA margin or >95% EBITDA margin on large revenue, or negative EBITDA with positive PAT)
+    if (
+        (ebitda <= 0 and pat > 0)
+        or abs(ebitda) / rev < 0.02
+        or abs(ebitda) / rev > 0.95
+        or abs(pat) / rev < 0.01
+        or abs(pat) / rev > 0.80
+    ):
         return False
 
-    # Cross-check against Screener's standardized ₹ Cr numbers if available
+    # Cross-check order-of-magnitude scale against Screener's standardized ₹ Cr Revenue & PAT
+    # (allow up to ~40% variance across adjacent quarters / standalone vs consolidated, while catching 10x Million/Billion shifts)
     if sc_ref:
         sc_m = sc_ref.get("metrics") or {}
         sc_rev = _parse_num((sc_m.get("revenue") or {}).get("value"))
-        sc_ebitda = _parse_num((sc_m.get("ebitda") or {}).get("value"))
         sc_pat = _parse_num((sc_m.get("pat") or {}).get("value"))
-        for pdf_v, sc_v in ((rev, sc_rev), (ebitda, sc_ebitda), (pat, sc_pat)):
-            if pdf_v is not None and sc_v is not None and sc_v != 0:
-                rel_diff = abs(pdf_v - sc_v) / abs(sc_v)
-                if rel_diff > 0.25:
+        for pdf_v, sc_v in ((rev, sc_rev), (pat, sc_pat)):
+            if pdf_v is not None and sc_v is not None and sc_v > 0:
+                ratio = pdf_v / sc_v
+                if ratio < 0.40 or ratio > 2.50:
                     return False
 
     return True
@@ -389,11 +395,26 @@ def enrich_quarterly_results(
     has_usable_pdf = len(pdf_text.strip()) > 600
 
     if has_usable_pdf:
+        sc_context = ""
+        if sc_ref and sc_ref.get("raw_table"):
+            headers = (sc_ref["raw_table"].get("headers") or [])[-3:]
+            rows_preview = [
+                {k: v for k, v in r.items() if k == "metric" or k in headers}
+                for r in (sc_ref["raw_table"].get("rows") or [])[:8]
+            ]
+            sc_context = (
+                f"\nReference Standardized Quarterly Table (₹ Cr) for {ticker} (use to verify ₹ Cr unit scale "
+                f"or compute QoQ % if the PDF press release only prints Q2 and H1 where Q1 = H1 - Q2):\n"
+                f"{json.dumps(rows_preview, ensure_ascii=False)}\n"
+            )
+
         prompt_pdf = f"""You are a financial analyst extracting headline quarterly results for {ticker}.
 Filing title: {filing_title}
 
 Extract the Consolidated financial numbers (or Standalone if Consolidated is not present) from the filing text below.
 CRITICAL UNIT RULE: Convert all values to ₹ Crores (₹ Cr) consistently across all 4 rows (1 Billion = 100 Crores, 10 Million = 1 Crore, 100 Lakhs = 1 Crore).
+BANK / NBFC RULE: For Banks or NBFCs (e.g. HDFCBANK, BAJFINANCE), use "Operating Profit before provisions and contingencies (PPOP)" for the "ebitda" field, and "Total Income" for "revenue".
+PRESS RELEASE RULE: If the PDF reports Q2 and H1 (Half-Year) numbers without explicitly printing Q1, derive Q1 = H1 - Q2 (or use the Reference Standardized Quarterly Table below) to compute QoQ %; if PBT is not in the Press Release, use the Reference Table or derive it if available.
 Format QoQ % and YoY % with an explicit leading '+' or '-' sign and trailing '%' (e.g. "+5.8%", "-2.1%").
 Return a JSON object with:
 - "has_numbers": boolean (true ONLY if actual numeric Revenue and PAT for the current quarter are present in the text)
@@ -406,7 +427,7 @@ Return a JSON object with:
     "pat":     {{"value": string, "qoq_pct": string, "yoy_pct": string}}
   }}
 - "takeaway": 1 concise sentence summarizing topline & bottomline performance (QoQ and YoY).
-
+{sc_context}
 Filing PDF Text:
 {pdf_text[:30000]}
 """

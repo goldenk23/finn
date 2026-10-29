@@ -1,9 +1,70 @@
 import json
+import logging
+import re
 from contextlib import asynccontextmanager
 from typing import Any
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+logger = logging.getLogger("finn.api")
+
+
+def _sanitize_log_message(msg: str) -> str:
+    """Strip any potential API key or bearer token substrings before logging."""
+    s = re.sub(r"(key|token|access_token)=[^&\s\"']+", r"\1=[REDACTED]", msg, flags=re.IGNORECASE)
+    s = re.sub(r"AIza[0-9A-Za-z\-_]{20,}", "[REDACTED_KEY]", s)
+    return s
+
+
+def _friendly_upstream_error(context: str, exc: Exception) -> HTTPException:
+    """
+    Logs technical details server-side (without secrets) and returns a short,
+    helpful user-facing HTTPException for the mobile UI.
+    """
+    raw = _sanitize_log_message(f"{type(exc).__name__}: {exc}")
+    logger.error("[%s] Upstream failure: %s", context, raw)
+
+    low = raw.lower()
+    if any(
+        k in low
+        for k in (
+            "winerror 10013",
+            "newconnectionerror",
+            "failed to establish a new connection",
+            "connecterror",
+            "nameresolutionerror",
+            "connection refused",
+        )
+    ):
+        return HTTPException(
+            status_code=503,
+            detail="Cannot reach Google AI service (outbound HTTPS socket blocked). Ensure the FastAPI backend is running in a normal network-authorized terminal.",
+        )
+    if any(
+        k in low
+        for k in (
+            "defaultcredentialserror",
+            "refresherror",
+            "unauthenticated",
+            "permission_denied",
+            "api_key_invalid",
+            "neither gemini_api_key nor google_cloud_project",
+        )
+    ):
+        return HTTPException(
+            status_code=503,
+            detail="AI authentication failed. Verify GEMINI_API_KEY or Vertex AI credentials (gcloud auth application-default login).",
+        )
+    if "429" in low or "resource_exhausted" in low or "quota" in low:
+        return HTTPException(
+            status_code=429,
+            detail="AI rate limit reached. Please wait a moment and try again.",
+        )
+    return HTTPException(
+        status_code=502,
+        detail=f"{context} is temporarily unavailable. Check backend logs for details.",
+    )
 
 from backend.db import init_db, get_conn, get_portfolio, get_alert_rules, DB_PATH
 from backend.scrapers.market_data import fetch_eod_metrics
@@ -232,8 +293,10 @@ def api_get_pull_report(
         else:
             data["eod"] = dict(eod_row)
         return data
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise _friendly_upstream_error(f"Pull research ({ticker.upper()})", exc)
 
 
 @app.post("/api/pull/{ticker}/ask")
@@ -242,8 +305,10 @@ def api_ask_pull_copilot(ticker: str, req: AskCopilotRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Question cannot be empty")
     try:
         return ask_pull_copilot(ticker=ticker, question=req.question.strip())
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise _friendly_upstream_error(f"Copilot Q&A ({ticker.upper()})", exc)
 
 
 @app.get("/api/cost")

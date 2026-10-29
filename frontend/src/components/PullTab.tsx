@@ -333,7 +333,14 @@ export function PullTab({
       setQuestion("");
       onCostUpdated();
     } catch (err) {
-      setQaError(err instanceof Error ? err.message : "Failed to query Copilot");
+      const rawMsg = err instanceof Error ? err.message : "Unable to reach Copilot right now.";
+      const friendly =
+        rawMsg.includes("HTTPSConnectionPool") || rawMsg.includes("WinError 10013")
+          ? "Cannot reach Google AI service (outbound HTTPS socket blocked). Restart the backend in a network-authorized terminal."
+          : rawMsg.length > 220
+          ? "Copilot could not complete this request right now. Please try again."
+          : rawMsg;
+      setQaError(friendly);
     } finally {
       setAsking(false);
     }
