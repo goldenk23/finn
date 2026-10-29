@@ -182,15 +182,39 @@ export function PushTab({
             ))}
           </div>
         ) : material.length === 0 ? (
-          <div className="rounded-xl border border-zinc-800/80 bg-zinc-900/40 p-6 text-center">
-            <CheckCircle2 className="w-6 h-6 text-zinc-600 mx-auto mb-1.5" />
-            <p className="text-xs font-medium text-zinc-300">
-              No material filings in the {window} window
-              {selectedTicker ? ` for ${selectedTicker}` : ""}.
-            </p>
-            <p className="text-[11px] text-zinc-500 mt-1">
-              Switch to a wider window (e.g. 14d or 30d) or tap Refresh Live.
-            </p>
+          <div className="rounded-xl border border-zinc-800/80 bg-zinc-900/40 p-5 text-center space-y-3">
+            <CheckCircle2 className="w-6 h-6 text-emerald-400/80 mx-auto" />
+            <div>
+              <p className="text-xs font-semibold text-zinc-200">
+                No material filings in the last {window}
+                {selectedTicker ? ` for ${selectedTicker}` : ""}.
+              </p>
+              <p className="text-[11px] text-zinc-400 mt-1">
+                {stats.routine_collapsed_count > 0
+                  ? `${stats.routine_collapsed_count} routine exchange notices were automatically filtered out.`
+                  : "Exchange feeds are quiet for this window."}
+              </p>
+            </div>
+
+            {window !== "7d" && window !== "14d" ? (
+              <button
+                type="button"
+                onClick={() => onChangeWindow("7d")}
+                className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 px-3.5 py-2 text-xs font-bold text-zinc-950 shadow-sm transition"
+              >
+                <span>
+                  Quiet last {window} across your portfolio — View 7d Material Signals →
+                </span>
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => onChangeWindow("14d")}
+                className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/15 hover:bg-emerald-500/25 px-3.5 py-1.5 text-xs font-semibold text-emerald-300 transition"
+              >
+                <span>Expand to 14d Material Signals →</span>
+              </button>
+            )}
           </div>
         ) : (
           material.map((f) => (

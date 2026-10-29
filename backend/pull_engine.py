@@ -229,6 +229,10 @@ STRICT DISCIPLINE:
 - Ground EVERY number, ratio, trajectory claim, and narrative comparison strictly in the provided Primary Source Bundle (Screener 10Y audited financials, quarterly exchange results, concall transcripts, investor presentations, and annual reports).
 - NO broker notes, NO news commentary, NO ungrounded outside assumptions.
 - Zero AI slop: write with high information density, sharp institutional judgment, and exact numbers (with ₹ Cr and % units).
+- BANKING & NBFC DOMAIN RULE (e.g., HDFCBANK, BAJFINANCE, banks/lenders where Screener reports 'Financing Profit', 'Financing Margin %', or 'Interest' instead of standard manufacturing/services EBITDA):
+  1) Map 'Financing Margin %' (or NIM / PPOP margin) into `latest_opm_pct` and `opm_pct` chart fields, and label it clearly in prose.
+  2) Do NOT flag high Borrowings / Deposits or high Debt-to-Equity as balance-sheet distress for a Bank or NBFC—deposits and borrowings are their core lending raw material. Instead evaluate Balance Sheet health on Capital Adequacy (CRAR/Tier-1), Asset Quality (GNPA/NNPA, credit costs), Reserves compounding, and ROE/ROA.
+  3) For Bank/NBFC Cash Quality, recognize that negative CFO during high loan-book growth reflects lending disbursements (working capital of a lender), not poor earnings quality; judge quality via ROE/ROA consistency, provisioning discipline, and PAT compounding.
 
 Return a single valid JSON object with the exact 8 modules below:
 {{

@@ -4,6 +4,13 @@ import yfinance as yf
 from backend.db import get_conn, get_alert_rules, DB_PATH
 
 
+# ponytail: map renamed/demerged NSE symbols on Yahoo Finance (ZOMATO -> ETERNAL.NS, TATAMOTORS -> TMPV.NS) so all 16 portfolio stocks price cleanly.
+YFINANCE_SYMBOL_ALIASES: dict[str, list[str]] = {
+    "ZOMATO": ["ETERNAL.NS", "543320.BO"],
+    "TATAMOTORS": ["TMPV.NS", "500570.BO"],
+}
+
+
 def fetch_eod_metrics(
     tickers: list[str], db_path: Path = DB_PATH, save_to_db: bool = True
 ) -> list[dict[str, Any]]:
@@ -19,13 +26,17 @@ def fetch_eod_metrics(
     results: list[dict[str, Any]] = []
     for raw_ticker in tickers:
         clean_ticker = raw_ticker.upper().replace(".NS", "").replace(".BO", "").strip()
-        yf_symbol = f"{clean_ticker}.NS"
+        candidate_symbols = YFINANCE_SYMBOL_ALIASES.get(
+            clean_ticker, [f"{clean_ticker}.NS", f"{clean_ticker}.BO"]
+        )
         try:
-            hist = yf.Ticker(yf_symbol).history(period="1mo", interval="1d", auto_adjust=True)
-            if hist.empty or len(hist) < 2:
-                # Fallback to BSE (.BO) if NSE ticker fails
-                hist = yf.Ticker(f"{clean_ticker}.BO").history(period="1mo", interval="1d", auto_adjust=True)
-            if hist.empty or len(hist) < 2:
+            hist = None
+            for sym in candidate_symbols:
+                h = yf.Ticker(sym).history(period="1mo", interval="1d", auto_adjust=True)
+                if not h.empty and len(h) >= 2:
+                    hist = h
+                    break
+            if hist is None or hist.empty or len(hist) < 2:
                 continue
 
             latest = hist.iloc[-1]

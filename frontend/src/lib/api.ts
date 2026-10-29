@@ -54,7 +54,7 @@ export const finnApi = {
       method: "DELETE",
     }),
 
-  getDigest: (window: TimeWindow = "14d", ticker?: string | null) => {
+  getDigest: (window: TimeWindow = "24h", ticker?: string | null) => {
     const params = new URLSearchParams({ window });
     if (ticker) params.set("ticker", ticker);
     return request<DigestResponse>(`/api/push/digest?${params.toString()}`);

@@ -35,8 +35,8 @@ export default function FinnAppPage() {
   const [portfolio, setPortfolio] = useState<PortfolioItem[]>([]);
   const [portfolioLoading, setPortfolioLoading] = useState<boolean>(true);
 
-  // Push Digest state
-  const [digestWindow, setDigestWindow] = useState<TimeWindow>("14d");
+  // Push Digest state (defaults to 24h per challenge brief)
+  const [digestWindow, setDigestWindow] = useState<TimeWindow>("24h");
   const [digestTicker, setDigestTicker] = useState<string | null>(null);
   const [digest, setDigest] = useState<DigestResponse | null>(null);
   const [digestLoading, setDigestLoading] = useState<boolean>(true);

@@ -44,6 +44,36 @@ interface PullTabProps {
 
 const ADHOC_DEMO_TICKERS = ["DIXON", "POLYCAB", "INDHOTEL", "PERSISTENT"];
 
+// ponytail: lightweight client-side NSE symbol + company name/alias directory resolves common investor searches (e.g. "Reliance", "Eternal" -> ZOMATO, "Taj" -> INDHOTEL) without an extra backend autocomplete roundtrip.
+const NSE_DIRECTORY: { ticker: string; name: string; aliases?: string[] }[] = [
+  { ticker: "RELIANCE", name: "Reliance Industries Ltd", aliases: ["ril", "jio"] },
+  { ticker: "TCS", name: "Tata Consultancy Services Ltd", aliases: ["tata consultancy"] },
+  { ticker: "HDFCBANK", name: "HDFC Bank Ltd", aliases: ["hdfc"] },
+  { ticker: "INFY", name: "Infosys Ltd", aliases: ["infosys"] },
+  { ticker: "TATAMOTORS", name: "Tata Motors Ltd", aliases: ["tamO", "jlr"] },
+  { ticker: "SUNPHARMA", name: "Sun Pharmaceutical Industries", aliases: ["sun pharma"] },
+  { ticker: "TRENT", name: "Trent Ltd (Zudio / Westside)", aliases: ["zudio", "westside"] },
+  { ticker: "LT", name: "Larsen & Toubro Ltd", aliases: ["l&t", "larsen"] },
+  { ticker: "BAJFINANCE", name: "Bajaj Finance Ltd", aliases: ["bajaj", "bafin"] },
+  { ticker: "MARUTI", name: "Maruti Suzuki India Ltd", aliases: ["suzuki"] },
+  { ticker: "ZOMATO", name: "Eternal Ltd (Zomato / Blinkit)", aliases: ["eternal", "blinkit"] },
+  { ticker: "HAL", name: "Hindustan Aeronautics Ltd", aliases: ["hindustan aeronautics"] },
+  { ticker: "ITC", name: "ITC Ltd", aliases: ["itc"] },
+  { ticker: "TITAN", name: "Titan Company Ltd", aliases: ["tanishq"] },
+  { ticker: "KPITTECH", name: "KPIT Technologies Ltd", aliases: ["kpit"] },
+  { ticker: "CIPLA", name: "Cipla Ltd", aliases: ["cipla"] },
+  { ticker: "DIXON", name: "Dixon Technologies (India) Ltd", aliases: ["dixon tech"] },
+  { ticker: "POLYCAB", name: "Polycab India Ltd", aliases: ["polycab"] },
+  { ticker: "INDHOTEL", name: "The Indian Hotels Company (Taj)", aliases: ["indian hotels", "taj", "ihcl"] },
+  { ticker: "PERSISTENT", name: "Persistent Systems Ltd", aliases: ["persistent"] },
+  { ticker: "ICICIBANK", name: "ICICI Bank Ltd", aliases: ["icici"] },
+  { ticker: "SBIN", name: "State Bank of India", aliases: ["sbi"] },
+  { ticker: "BHARTIARTL", name: "Bharti Airtel Ltd", aliases: ["airtel"] },
+  { ticker: "BEL", name: "Bharat Electronics Ltd", aliases: ["bharat electronics"] },
+  { ticker: "M&M", name: "Mahindra & Mahindra Ltd", aliases: ["mahindra"] },
+  { ticker: "ULTRACEMCO", name: "UltraTech Cement Ltd", aliases: ["ultratech"] },
+];
+
 const QUICK_QUESTIONS = [
   "What drove operating margin & PAT performance over the last 4 quarters?",
   "How does CFO compare to PAT and what is driving working capital days?",
@@ -234,11 +264,60 @@ export function PullTab({
 
   const cachedSet = new Set(cachedReports.map((c) => c.ticker));
 
+  // Merge portfolio + NSE_DIRECTORY for instant client-side company name/alias autocomplete
+  const directoryList = React.useMemo(() => {
+    const map = new Map<string, { ticker: string; name: string; aliases: string[] }>();
+    for (const item of NSE_DIRECTORY) {
+      map.set(item.ticker, {
+        ticker: item.ticker,
+        name: item.name,
+        aliases: item.aliases || [],
+      });
+    }
+    for (const p of portfolio) {
+      if (!map.has(p.ticker)) {
+        map.set(p.ticker, {
+          ticker: p.ticker,
+          name: p.company_name || p.ticker,
+          aliases: [],
+        });
+      }
+    }
+    return Array.from(map.values());
+  }, [portfolio]);
+
+  const suggestions = React.useMemo(() => {
+    const q = searchInput.trim().toLowerCase().replace(".ns", "").replace(".bo", "");
+    if (!q) return [];
+    return directoryList
+      .filter(
+        (d) =>
+          d.ticker.toLowerCase().includes(q) ||
+          d.name.toLowerCase().includes(q) ||
+          d.aliases.some((a) => a.toLowerCase().includes(q))
+      )
+      .slice(0, 5);
+  }, [searchInput, directoryList]);
+
+  function resolveTickerSymbol(raw: string): string {
+    const cleaned = raw.trim().toUpperCase().replace(".NS", "").replace(".BO", "");
+    if (!cleaned) return "";
+    const exact = directoryList.find((d) => d.ticker === cleaned);
+    if (exact) return exact.ticker;
+    const q = cleaned.toLowerCase();
+    const matched = directoryList.find(
+      (d) =>
+        d.name.toLowerCase().includes(q) ||
+        d.aliases.some((a) => a.toLowerCase() === q || a.toLowerCase().includes(q))
+    );
+    return matched ? matched.ticker : cleaned;
+  }
+
   function handleSearchSubmit(e: React.FormEvent) {
     e.preventDefault();
-    const cleaned = searchInput.trim().toUpperCase().replace(".NS", "").replace(".BO", "");
-    if (cleaned) {
-      onSelectTicker(cleaned, false);
+    const resolved = resolveTickerSymbol(searchInput);
+    if (resolved) {
+      onSelectTicker(resolved, false);
       setSearchInput("");
     }
   }
@@ -269,24 +348,65 @@ export function PullTab({
     <div className="space-y-4 pb-8">
       {/* Search Any NSE/BSE Ticker Bar */}
       <div className="rounded-xl border border-zinc-800 bg-zinc-900/90 p-3">
-        <form onSubmit={handleSearchSubmit} className="flex items-center gap-2">
-          <div className="relative flex-1">
-            <Search className="w-3.5 h-3.5 text-zinc-400 absolute left-3 top-1/2 -translate-y-1/2" />
-            <input
-              type="text"
-              value={searchInput}
-              onChange={(e) => setSearchInput(e.target.value)}
-              placeholder="Search ANY NSE ticker (e.g. DIXON, POLYCAB, HAL)..."
-              className="w-full rounded-lg border border-zinc-800 bg-zinc-950 pl-8 pr-3 py-1.5 text-xs text-white placeholder-zinc-500 focus:border-emerald-500 focus:outline-none font-mono"
-            />
+        <form onSubmit={handleSearchSubmit} className="relative">
+          <div className="flex items-center gap-2">
+            <div className="relative flex-1">
+              <Search className="w-3.5 h-3.5 text-zinc-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                value={searchInput}
+                onChange={(e) => setSearchInput(e.target.value)}
+                placeholder="Ticker or company (e.g. Reliance, Eternal, DIXON)..."
+                className="w-full rounded-lg border border-zinc-800 bg-zinc-950 pl-8 pr-3 py-1.5 text-xs text-white placeholder-zinc-500 focus:border-emerald-500 focus:outline-none font-mono"
+              />
+            </div>
+            <button
+              type="submit"
+              disabled={loading}
+              className="rounded-lg bg-emerald-500 hover:bg-emerald-400 px-3 py-1.5 text-xs font-bold text-zinc-950 transition disabled:opacity-50"
+            >
+              Analyze
+            </button>
           </div>
-          <button
-            type="submit"
-            disabled={loading}
-            className="rounded-lg bg-emerald-500 hover:bg-emerald-400 px-3 py-1.5 text-xs font-bold text-zinc-950 transition disabled:opacity-50"
-          >
-            Analyze
-          </button>
+
+          {/* Client-side Autocomplete Dropdown */}
+          {suggestions.length > 0 && (
+            <div className="mt-1.5 rounded-lg border border-zinc-700 bg-zinc-950 shadow-xl divide-y divide-zinc-800/80 overflow-hidden">
+              {suggestions.map((item) => {
+                const isCached = cachedSet.has(item.ticker);
+                return (
+                  <button
+                    key={item.ticker}
+                    type="button"
+                    onClick={() => {
+                      onSelectTicker(item.ticker, false);
+                      setSearchInput("");
+                    }}
+                    className="w-full flex items-center justify-between px-3 py-2 text-left hover:bg-zinc-900 transition"
+                  >
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="font-mono text-xs font-bold text-emerald-400">
+                        {item.ticker}
+                      </span>
+                      <span className="text-xs text-zinc-300 truncate">
+                        {item.name}
+                      </span>
+                    </div>
+                    {isCached ? (
+                      <span className="inline-flex items-center gap-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 px-1.5 py-0.5 text-[9px] font-mono text-emerald-300 shrink-0">
+                        <Zap className="w-2.5 h-2.5" />
+                        Instant Cache
+                      </span>
+                    ) : (
+                      <span className="text-[10px] font-mono text-zinc-500 shrink-0">
+                        NSE
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          )}
         </form>
 
         {/* Quick Select Chips: Portfolio + Outside-Portfolio Ad-Hoc Tickers */}
