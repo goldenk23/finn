@@ -33,29 +33,81 @@ CATEGORY_RULES: list[tuple[str, str, int]] = [
 ]
 
 
-def classify_heuristic(title: str, desc: str = "") -> tuple[str, int]:
-    text = f"{title} {desc}".lower()
+def enforce_filing_hygiene(title: str, category: str, materiality: int) -> tuple[str, int]:
+    """
+    Root-cause guard ensuring routine exchange noise (newspaper clippings, Reg 74(5) depository
+    certificates, trading window closures, analyst meet schedules, prior board meeting notices)
+    is never promoted to materiality=1 by either regex heuristics or LLM triage.
+    """
+    t = (title or "").lower()
+
+    # 1. Hard routine noise -> always unclassified, materiality=0
     if any(
-        noise in text
+        noise in t
         for noise in [
+            "copy of newspaper publication",
+            "newspaper publication",
+            "newspaper advertisement",
+            "newspaper clipping",
+            "newspaper intimation",
+            "certificate under sebi (depositories and participants)",
+            "regulation 74(5)",
             "loss of share certificate",
             "duplicate share",
             "esop",
             "employee stock option",
-            "newspaper advertisement",
-            "newspaper publication",
-            "compliance certificate",
-            "regulation 74(5)",
             "closure of trading window",
             "trading window",
+            "compliance certificate",
+            "redemption of commercial paper",
         ]
     ):
         return "unclassified", 0
 
-    for pattern, cat, mat in CATEGORY_RULES:
+    # 2. Analyst / Investor Meet updates: only material if it is an actual Transcript or Recording
+    if any(
+        k in t
+        for k in [
+            "analysts/institutional investor meet",
+            "analyst/institutional investor meet",
+            "schedule of analyst",
+            "investor meet",
+        ]
+    ):
+        if any(rec in t for rec in ["transcript", "audio recording", "link of recording", "video recording"]):
+            return "earnings_call", 1
+        return "investor_meetings", 0
+
+    # 3. Prior board meeting date intimations vs actual quarterly financial results
+    if category == "results":
+        if ("jio platforms" in t or "initial public offer" in t) and "outcome of board meeting" not in t:
+            return "fund_raise", 1
+        if any(
+            prior in t
+            for prior in [
+                "is scheduled on",
+                "will be held on",
+                "meeting of the board of directors of the company is scheduled",
+                "intimation of board meeting",
+            ]
+        ) and "outcome of board meeting" not in t:
+            return "unclassified", 0
+
+    if category in ("unclassified", "investor_meetings", "postal_ballot", "agm_egm"):
+        return category, 0
+
+    return category, materiality
+
+
+def classify_heuristic(title: str, desc: str = "") -> tuple[str, int]:
+    full_title = f"{title}: {desc}" if desc and desc != title else title
+    text = full_title.lower()
+    cat, mat = "unclassified", 0
+    for pattern, c, m in CATEGORY_RULES:
         if re.search(pattern, text):
-            return cat, mat
-    return "unclassified", 0
+            cat, mat = c, m
+            break
+    return enforce_filing_hygiene(full_title, cat, mat)
 
 
 def _make_filing_id(ticker: str, title: str, pub_dt: str, pdf_url: str) -> str:

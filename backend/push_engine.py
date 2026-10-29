@@ -1,11 +1,12 @@
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
+import re
 from typing import Any
 
 from backend.db import get_conn, get_portfolio, get_alert_rules, DB_PATH
 from backend.scrapers.market_data import fetch_eod_metrics
-from backend.scrapers.filings import fetch_company_filings
+from backend.scrapers.filings import fetch_company_filings, enforce_filing_hygiene
 from backend.llm_router import (
     classify_and_summarize_batch,
     enrich_quarterly_results,
@@ -174,13 +175,82 @@ def refresh_portfolio_push_data(
 
 def _format_announcement_row(row: Any) -> dict[str, Any]:
     d = dict(row)
+    cat, mat = enforce_filing_hygiene(
+        d.get("title", ""), d.get("category", "unclassified"), int(d.get("materiality", 0))
+    )
+    d["category"] = cat
+    d["materiality"] = mat
     try:
-        d["enriched"] = json.loads(d.get("enriched_json") or "{}")
+        d["enriched"] = json.loads(d.get("enriched_json") or "{}") if mat == 1 else {}
     except Exception:
         d["enriched"] = {}
     d.pop("enriched_json", None)
     d["priority_rank"] = CATEGORY_PRIORITY.get(d.get("category", "unclassified"), 17)
     return d
+
+
+def _richness_score(item: dict[str, Any]) -> tuple[int, int, float]:
+    """
+    Ranks duplicate filings for the same corporate event so the most informative card wins.
+    """
+    enr = item.get("enriched") or {}
+    has_enr = 1 if enr else 0
+    has_source_or_metrics = 1 if (enr.get("metrics") or enr.get("source_url")) else 0
+    is_board_outcome = 1 if "outcome of board meeting" in (item.get("title") or "").lower() else 0
+    return (
+        has_enr + has_source_or_metrics,
+        is_board_outcome,
+        _ts_epoch(item.get("published_at", "")),
+    )
+
+
+def _deduplicate_material_filings(
+    material: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    Deduplicates multiple NSE/BSE exchange filings for the same stock and event
+    (e.g. TRENT Harish Bhat resignation filed twice, or Outcome of Board Meeting + Auditor Report for same results).
+    Returns (deduped_material, collapsed_duplicates).
+    """
+    best_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
+    duplicates: list[dict[str, Any]] = []
+
+    for item in material:
+        ticker = item.get("ticker", "")
+        cat = item.get("category", "")
+        title_low = (item.get("title") or "").lower()
+        date_day = (item.get("published_at") or "")[:10]
+        enr = item.get("enriched") or {}
+
+        if cat == "results":
+            key: tuple[Any, ...] = (ticker, "results")
+        elif cat == "management_change":
+            person = (enr.get("person_name") or "").strip().lower()
+            action = (
+                enr.get("action")
+                or ("resign" if "resign" in title_low else "appoint")
+            ).strip().lower()[:6]
+            if person and person != "unknown":
+                key = (ticker, "management_change", person)
+            else:
+                key = (ticker, "management_change", action, date_day)
+        else:
+            norm_prefix = re.sub(r"[^a-z0-9]", "", title_low)[:36]
+            key = (ticker, cat, date_day, norm_prefix)
+
+        existing = best_by_key.get(key)
+        if existing is None:
+            best_by_key[key] = item
+        else:
+            if _richness_score(item) > _richness_score(existing):
+                duplicates.append(existing)
+                best_by_key[key] = item
+            else:
+                duplicates.append(item)
+
+    deduped = list(best_by_key.values())
+    deduped.sort(key=lambda x: (x["priority_rank"], -_ts_epoch(x["published_at"])))
+    return deduped, duplicates
 
 
 def get_windowed_digest(
@@ -219,11 +289,11 @@ def get_windowed_digest(
             ).fetchall()
 
     all_items = [_format_announcement_row(r) for r in rows]
-    material = [x for x in all_items if x["materiality"] == 1]
+    raw_material = [x for x in all_items if x["materiality"] == 1]
     routine = [x for x in all_items if x["materiality"] == 0]
 
-    # Sort material filings by priority category first, then newest timestamp
-    material.sort(key=lambda x: (x["priority_rank"], -_ts_epoch(x["published_at"])))
+    material, collapsed_dups = _deduplicate_material_filings(raw_material)
+    routine = collapsed_dups + routine
 
     total = len(all_items)
     noise_pct = round((len(routine) / total) * 100, 1) if total > 0 else 0.0
@@ -310,14 +380,18 @@ def get_triggered_alerts(
             d["trigger_reasons"] = reasons
             market_alerts.append(d)
 
-    filing_alerts: list[dict[str, Any]] = []
+    raw_filing_alerts: list[dict[str, Any]] = []
     for r in ann_rows:
         item = _format_announcement_row(r)
+        if item["materiality"] != 1:
+            continue
         if wanted and item["ticker"] not in wanted:
             continue
         if item["category"] in watched_cats:
             item["trigger_reason"] = f"Watched material category: {item['category']}"
-            filing_alerts.append(item)
+            raw_filing_alerts.append(item)
+
+    filing_alerts, _ = _deduplicate_material_filings(raw_filing_alerts)
 
     return {
         "rules": rules,

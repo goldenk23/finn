@@ -249,3 +249,4 @@ def api_ask_pull_copilot(ticker: str, req: AskCopilotRequest) -> dict[str, Any]:
 @app.get("/api/cost")
 def api_get_cost_ledger() -> dict[str, Any]:
     return get_cost_summary()
+

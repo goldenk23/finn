@@ -3,11 +3,9 @@
 .env.*
 !.env.example
 
-# SQLite Databases & WAL files
-*.db
+# SQLite WAL / Shared-Memory temp files (keep pre-warmed backend/finn.db tracked for instant demo)
 *.db-shm
 *.db-wal
-*.sqlite*
 
 # Python
 __pycache__/
@@ -27,4 +25,3 @@ out/
 dist/
 *.tsbuildinfo
 next-env.d.ts
-

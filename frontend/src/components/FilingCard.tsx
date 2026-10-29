@@ -67,11 +67,15 @@ const CATEGORY_STYLES: Record<string, { label: string; cls: string }> = {
 };
 
 function DeltaPill({ val }: { val?: string }) {
-  if (!val || val === "N/A" || val === "-") {
+  if (!val || val === "N/A" || val === "-" || val === "—") {
     return <span className="text-[11px] font-mono text-zinc-500">—</span>;
   }
-  const isNeg = val.trim().startsWith("-");
-  const isPos = val.trim().startsWith("+") || (!isNeg && parseFloat(val) > 0);
+  const num = parseFloat(val.replace(/[,+%]/g, "").trim());
+  const isNeg = !isNaN(num) ? num < 0 : val.trim().startsWith("-");
+  const isPos = !isNaN(num) ? num > 0 : val.trim().startsWith("+");
+  const display = !isNaN(num)
+    ? `${num > 0 ? "+" : ""}${num.toFixed(1)}%`
+    : val;
   return (
     <span
       className={`inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[11px] font-mono font-medium ${
@@ -83,7 +87,7 @@ function DeltaPill({ val }: { val?: string }) {
       }`}
     >
       {isPos ? <TrendingUp className="w-2.5 h-2.5" /> : isNeg ? <TrendingDown className="w-2.5 h-2.5" /> : null}
-      {val}
+      {display}
     </span>
   );
 }

@@ -10,6 +10,7 @@ from ddgs import DDGS
 from backend.db import get_conn, DB_PATH
 from backend.pdf_utils import extract_pdf_text, extract_results_pdf_text
 from backend.scrapers.screener import fetch_screener_fundamentals
+from backend.scrapers.filings import enforce_filing_hygiene
 
 # Load .env from project root
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -201,6 +202,7 @@ Input filings:
 {json.dumps(payload, ensure_ascii=False)}
 """
         try:
+            title_by_id = {f["filing_id"]: f.get("title", "") for f in batch}
             parsed = _call_gemini_json(
                 prompt=prompt,
                 model=MODEL_FLASH_LITE,
@@ -217,8 +219,7 @@ Input filings:
                 if cat not in VALID_CATEGORIES:
                     cat = "unclassified"
                 mat = 1 if int(item.get("materiality", 0)) == 1 else 0
-                if cat == "unclassified":
-                    mat = 0
+                cat, mat = enforce_filing_hygiene(title_by_id.get(fid, ""), cat, mat)
                 results[fid] = {
                     "category": cat,
                     "materiality": mat,
@@ -230,6 +231,142 @@ Input filings:
     return results
 
 
+def _parse_num(val: Any) -> float | None:
+    if val is None:
+        return None
+    s = str(val).replace(",", "").replace("₹", "").replace("Cr", "").replace("%", "").strip()
+    if not s or s.lower() in ("n/a", "-", "none", "null"):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _format_inr(val: Any) -> str:
+    num = _parse_num(val)
+    if num is None:
+        return str(val or "—")
+    if abs(num) >= 100 or num == int(num):
+        return f"{int(round(num)):,}"
+    return f"{num:,.1f}"
+
+
+def _format_pct(val: Any) -> str:
+    num = _parse_num(val)
+    if num is None:
+        return "—"
+    return f"{num:+.1f}%"
+
+
+def _normalize_results_enrichment(res: dict[str, Any]) -> dict[str, Any]:
+    metrics = res.get("metrics") or {}
+    for k in ("revenue", "ebitda", "pbt", "pat"):
+        m = metrics.get(k) or {}
+        if isinstance(m, dict):
+            m["value"] = _format_inr(m.get("value"))
+            m["qoq_pct"] = _format_pct(m.get("qoq_pct"))
+            m["yoy_pct"] = _format_pct(m.get("yoy_pct"))
+            metrics[k] = m
+    res["metrics"] = metrics
+    res["unit"] = "₹ Cr"
+    return res
+
+
+def _compute_screener_quarterly_metrics(ticker: str) -> dict[str, Any] | None:
+    """
+    Deterministically computes latest quarter Revenue, EBITDA (or Financing Profit),
+    PBT, and PAT with exact QoQ % and YoY % from Screener's normalized ₹ Cr table.
+    """
+    sc_data = fetch_screener_fundamentals(ticker)
+    q_table = sc_data.get("quarters", {})
+    headers = q_table.get("headers") or []
+    rows = q_table.get("rows") or []
+    if len(headers) < 2 or not rows:
+        return None
+
+    q_curr = headers[-1]
+    q_prev = headers[-2]
+    q_yoy = headers[-5] if len(headers) >= 5 else None
+
+    def _find_row(names: tuple[str, ...]) -> dict[str, Any] | None:
+        for r in rows:
+            m_name = (r.get("metric") or "").lower().strip()
+            if any(m_name.startswith(n) for n in names):
+                return r
+        return None
+
+    rev_row = _find_row(("sales", "revenue"))
+    ebitda_row = _find_row(("operating profit", "financing profit"))
+    pbt_row = _find_row(("profit before tax",))
+    pat_row = _find_row(("net profit",))
+
+    def _build_metric(row: dict[str, Any] | None) -> dict[str, str]:
+        if not row:
+            return {"value": "—", "qoq_pct": "—", "yoy_pct": "—"}
+        v_curr = _parse_num(row.get(q_curr))
+        v_prev = _parse_num(row.get(q_prev))
+        v_yoy = _parse_num(row.get(q_yoy)) if q_yoy else None
+
+        qoq_str = "—"
+        if v_curr is not None and v_prev is not None and v_prev != 0:
+            qoq_str = f"{((v_curr - v_prev) / abs(v_prev)) * 100.0:+.1f}%"
+
+        yoy_str = "—"
+        if v_curr is not None and v_yoy is not None and v_yoy != 0:
+            yoy_str = f"{((v_curr - v_yoy) / abs(v_yoy)) * 100.0:+.1f}%"
+
+        return {
+            "value": _format_inr(v_curr) if v_curr is not None else "—",
+            "qoq_pct": qoq_str,
+            "yoy_pct": yoy_str,
+        }
+
+    return {
+        "has_numbers": True,
+        "period": q_curr,
+        "unit": "₹ Cr",
+        "source": "Screener Primary Filing Data (Consolidated ₹ Cr)",
+        "metrics": {
+            "revenue": _build_metric(rev_row),
+            "ebitda": _build_metric(ebitda_row),
+            "pbt": _build_metric(pbt_row),
+            "pat": _build_metric(pat_row),
+        },
+        "raw_table": q_table,
+    }
+
+
+def _is_pdf_extraction_sane(pdf_res: dict[str, Any], sc_ref: dict[str, Any] | None) -> bool:
+    """
+    Guards against PDF unit-shift bugs (e.g. Revenue in ₹ Cr but EBITDA/PAT shifted 10x from ₹ Billion/Million).
+    """
+    m = pdf_res.get("metrics") or {}
+    rev = _parse_num((m.get("revenue") or {}).get("value"))
+    ebitda = _parse_num((m.get("ebitda") or {}).get("value"))
+    pat = _parse_num((m.get("pat") or {}).get("value"))
+    if rev is None or rev <= 0 or ebitda is None or pat is None:
+        return False
+
+    # Implausible margin ratio (<2.5% EBITDA margin or >95% EBITDA margin on large revenue)
+    if abs(ebitda) / rev < 0.025 or abs(ebitda) / rev > 0.95 or abs(pat) / rev < 0.015:
+        return False
+
+    # Cross-check against Screener's standardized ₹ Cr numbers if available
+    if sc_ref:
+        sc_m = sc_ref.get("metrics") or {}
+        sc_rev = _parse_num((sc_m.get("revenue") or {}).get("value"))
+        sc_ebitda = _parse_num((sc_m.get("ebitda") or {}).get("value"))
+        sc_pat = _parse_num((sc_m.get("pat") or {}).get("value"))
+        for pdf_v, sc_v in ((rev, sc_rev), (ebitda, sc_ebitda), (pat, sc_pat)):
+            if pdf_v is not None and sc_v is not None and sc_v != 0:
+                rel_diff = abs(pdf_v - sc_v) / abs(sc_v)
+                if rel_diff > 0.25:
+                    return False
+
+    return True
+
+
 def enrich_quarterly_results(
     ticker: str,
     filing_title: str,
@@ -239,24 +376,29 @@ def enrich_quarterly_results(
     """
     Tier 2 (gemini-2.5-flash):
     Extracts Revenue, EBITDA, PBT, and PAT with QoQ and YoY % changes.
-    First tries the actual results filing PDF; if scanned/missing numbers, falls back to Screener's quarterly table.
+    Cross-checks PDF extraction against Screener's normalized ₹ Cr quarterly table
+    to prevent PDF unit-conversion anomalies (Million/Billion vs Crore), and formats all % deltas consistently.
     """
+    sc_ref: dict[str, Any] | None = None
+    try:
+        sc_ref = _compute_screener_quarterly_metrics(ticker)
+    except Exception as exc:
+        print(f"[llm_router] Screener reference fetch warning for {ticker}: {exc}")
+
     pdf_text = extract_results_pdf_text(pdf_url, max_pages=10) if pdf_url else ""
     has_usable_pdf = len(pdf_text.strip()) > 600
-
-    screener_quarters_json = ""
-    source_label = "Exchange Filing PDF"
 
     if has_usable_pdf:
         prompt_pdf = f"""You are a financial analyst extracting headline quarterly results for {ticker}.
 Filing title: {filing_title}
 
 Extract the Consolidated financial numbers (or Standalone if Consolidated is not present) from the filing text below.
-Determine whether the filing actually contains the quarterly financial results numbers (Revenue, EBITDA, PBT, PAT).
+CRITICAL UNIT RULE: Convert all values to ₹ Crores (₹ Cr) consistently across all 4 rows (1 Billion = 100 Crores, 10 Million = 1 Crore, 100 Lakhs = 1 Crore).
+Format QoQ % and YoY % with an explicit leading '+' or '-' sign and trailing '%' (e.g. "+5.8%", "-2.1%").
 Return a JSON object with:
 - "has_numbers": boolean (true ONLY if actual numeric Revenue and PAT for the current quarter are present in the text)
-- "period": string (e.g. "Q1 FY27 (Jun 2026)")
-- "unit": string (normalized to "₹ Cr" if possible)
+- "period": string (e.g. "Q2 FY27 (Sep 2026)")
+- "unit": "₹ Cr"
 - "metrics": {{
     "revenue": {{"value": string, "qoq_pct": string, "yoy_pct": string}},
     "ebitda":  {{"value": string, "qoq_pct": string, "yoy_pct": string}},
@@ -276,57 +418,42 @@ Filing PDF Text:
                 ticker=ticker,
                 db_path=db_path,
             )
-            if isinstance(res, dict) and res.get("has_numbers") is True:
-                res["source"] = source_label
-                return res
+            if isinstance(res, dict) and res.get("has_numbers") is True and _is_pdf_extraction_sane(res, sc_ref):
+                res["source"] = "Exchange Filing PDF"
+                return _normalize_results_enrichment(res)
         except Exception as exc:
-            print(f"[llm_router] PDF results extraction failed for {ticker}, trying Screener fallback: {exc}")
+            print(f"[llm_router] PDF results extraction failed for {ticker}, using Screener table: {exc}")
 
-    # Fallback to Screener quarterly table when PDF is scanned, a board notice, or lacks full table
+    if not sc_ref:
+        return {"has_numbers": False, "error": f"No usable quarterly table for {ticker}"}
+
+    prompt_takeaway = f"""Write a 1-sentence institutional takeaway for {ticker}'s {sc_ref['period']} quarterly results (in ₹ Cr):
+Metrics: {json.dumps(sc_ref['metrics'], ensure_ascii=False)}
+Return JSON: {{"takeaway": "1 concise sentence highlighting Revenue & PAT QoQ/YoY growth and operating margin direction."}}"""
+    takeaway = f"{ticker} reported {sc_ref['period']} Revenue of ₹{sc_ref['metrics']['revenue']['value']} Cr ({sc_ref['metrics']['revenue']['qoq_pct']} QoQ, {sc_ref['metrics']['revenue']['yoy_pct']} YoY) and PAT of ₹{sc_ref['metrics']['pat']['value']} Cr ({sc_ref['metrics']['pat']['qoq_pct']} QoQ, {sc_ref['metrics']['pat']['yoy_pct']} YoY)."
     try:
-        sc_data = fetch_screener_fundamentals(ticker)
-        q_table = sc_data.get("quarters", {})
-        screener_quarters_json = json.dumps(q_table, ensure_ascii=False)
-        source_label = "Screener Primary Filing Data (Fallback)"
-    except Exception as exc:
-        return {"has_numbers": False, "error": f"Failed to fetch fallback data: {exc}"}
+        t_res = _call_gemini_json(
+            prompt=prompt_takeaway,
+            model=MODEL_FLASH,
+            workflow="push_enrich_results_fallback",
+            ticker=ticker,
+            db_path=db_path,
+        )
+        if isinstance(t_res, dict) and t_res.get("takeaway"):
+            takeaway = t_res["takeaway"].strip()
+    except Exception:
+        pass
 
-    prompt_fallback = f"""You are a financial analyst extracting headline quarterly results for {ticker}.
-The exchange filing PDF was either a notice or scanned image, so use the company's primary quarterly filing table below.
-Take the latest quarter column, the immediately preceding quarter column (for QoQ %), and the same quarter a year ago (4 quarters back, for YoY %).
-Map:
-- Revenue = Sales / Revenue
-- EBITDA = Operating Profit
-- PBT = Profit before tax
-- PAT = Net Profit
-
-Compute exact QoQ % and YoY % changes (formatted with sign like "+5.8%" or "-2.1%").
-Return a JSON object with:
-- "has_numbers": true
-- "period": string (the latest quarter column header, e.g. "Jun 2026")
-- "unit": "₹ Cr"
-- "source": "{source_label}"
-- "metrics": {{
-    "revenue": {{"value": string, "qoq_pct": string, "yoy_pct": string}},
-    "ebitda":  {{"value": string, "qoq_pct": string, "yoy_pct": string}},
-    "pbt":     {{"value": string, "qoq_pct": string, "yoy_pct": string}},
-    "pat":     {{"value": string, "qoq_pct": string, "yoy_pct": string}}
-  }}
-- "takeaway": 1 concise sentence highlighting Revenue & PAT QoQ/YoY growth and operating margin direction.
-
-Quarterly Data Table:
-{screener_quarters_json}
-"""
-    res = _call_gemini_json(
-        prompt=prompt_fallback,
-        model=MODEL_FLASH,
-        workflow="push_enrich_results_fallback",
-        ticker=ticker,
-        db_path=db_path,
+    return _normalize_results_enrichment(
+        {
+            "has_numbers": True,
+            "period": sc_ref["period"],
+            "unit": "₹ Cr",
+            "source": sc_ref["source"],
+            "metrics": sc_ref["metrics"],
+            "takeaway": takeaway,
+        }
     )
-    if isinstance(res, dict):
-        res["source"] = source_label
-    return res
 
 
 def _search_executive_web(person_name: str, company_name: str) -> list[dict[str, str]]:
@@ -383,6 +510,10 @@ Return a JSON object with:
         ticker=ticker,
         db_path=db_path,
     )
+    if isinstance(info, list):
+        info = info[0] if info and isinstance(info[0], dict) else {}
+    elif not isinstance(info, dict):
+        info = {}
     person_name = (info.get("person_name") or "Unknown").strip()
     role = (info.get("role") or "").strip()
     action = (info.get("action") or "Management Change").strip()
@@ -413,7 +544,9 @@ Return a JSON object with:
         ticker=ticker,
         db_path=db_path,
     )
-    return enriched
+    if isinstance(enriched, list):
+        enriched = enriched[0] if enriched and isinstance(enriched[0], dict) else {}
+    return enriched if isinstance(enriched, dict) else {}
 
 
 def call_gemini_pro_json(
