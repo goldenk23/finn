@@ -311,6 +311,30 @@ export function FilingCard({
         </div>
       )}
 
+      {/* Duplicate exchange filings for the same event, folded into this card */}
+      {filing.also_filed_as && filing.also_filed_as.length > 0 && (
+        <div className="mt-2 text-xs text-zinc-500 leading-snug">
+          <span className="font-medium text-zinc-400">Also filed as: </span>
+          {filing.also_filed_as.map((dup, i) => (
+            <span key={dup.filing_id}>
+              {i > 0 && "; "}
+              {dup.pdf_url ? (
+                <a
+                  href={dup.pdf_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-zinc-400 hover:text-zinc-200 underline decoration-zinc-700"
+                >
+                  {dup.title}
+                </a>
+              ) : (
+                dup.title
+              )}
+            </span>
+          ))}
+        </div>
+      )}
+
       {/* Footer actions: PDF Link + On-Demand Enrich + Pull Jump */}
       <div className="mt-2.5 flex items-center justify-between gap-2 pt-2 border-t border-zinc-800/60">
         <div className="flex items-center gap-2">

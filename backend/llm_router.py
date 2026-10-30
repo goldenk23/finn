@@ -14,7 +14,7 @@ from ddgs import DDGS
 from backend.db import get_conn, DB_PATH
 from backend.pdf_utils import extract_pdf_text, extract_results_pdf_text
 from backend.scrapers.screener import fetch_screener_fundamentals
-from backend.scrapers.filings import enforce_filing_hygiene
+from backend.scrapers.filings import enforce_filing_hygiene, is_bank_or_nbfc, is_vague_title
 
 # Load .env from project root
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -271,6 +271,20 @@ def _call_gemini_json(*args: Any, **kwargs: Any) -> Any:
     return _call_gemini_json_with_model(*args, **kwargs)[0]
 
 
+NO_DETAIL_SUMMARY = "Filing does not specify details; see attached PDF"
+# ponytail: page 1 only, capped, so a 15-filing batch adds at most ~22k chars (~6k Flash-Lite tokens)
+PDF_EXCERPT_CHARS = 1500
+
+
+def _pdf_page1_excerpt(pdf_url: str) -> str:
+    """First PDF_EXCERPT_CHARS of page 1, whitespace collapsed. Reuses backend/cache_pdfs/ via download_pdf."""
+    if not pdf_url:
+        return ""
+    text = extract_pdf_text(pdf_url, max_pages=1, max_chars_per_page=PDF_EXCERPT_CHARS)
+    text = re.sub(r"^\s*--- \[Page \d+ of \d+\] ---", "", text)
+    return " ".join(text.split())[:PDF_EXCERPT_CHARS]
+
+
 def classify_and_summarize_batch(
     filings: list[dict[str, Any]], db_path: Path = DB_PATH, batch_size: int = 15
 ) -> dict[str, dict[str, Any]]:
@@ -278,6 +292,8 @@ def classify_and_summarize_batch(
     Tier 1 (MODEL_FLASH_LITE):
     Batch-classifies corporate announcements into the 17 categories, assigns materiality (0 or 1),
     and generates a sharp 1-line investor summary.
+    Vague titles ("Change in Director(s)") carry the start of their PDF; with no PDF text they get NO_DETAIL_SUMMARY.
+    Filings missing from the returned map were not triaged and must stay blank.
     """
     if not filings:
         return {}
@@ -285,15 +301,28 @@ def classify_and_summarize_batch(
     results: dict[str, dict[str, Any]] = {}
     for i in range(0, len(filings), batch_size):
         batch = filings[i : i + batch_size]
-        payload = [
-            {
+        payload = []
+        for f in batch:
+            entry = {
                 "filing_id": f["filing_id"],
                 "ticker": f["ticker"],
                 "title": f["title"],
                 "heuristic_category": f.get("category", "unclassified"),
             }
-            for f in batch
-        ]
+            if is_vague_title(f["title"]):
+                excerpt = _pdf_page1_excerpt(f.get("pdf_url") or "")
+                if not excerpt:
+                    # Nothing to read beyond a generic title: keep the regex category, don't let the model guess
+                    cat, mat = enforce_filing_hygiene(
+                        f["title"], f.get("category") or "unclassified", int(f.get("materiality") or 0),
+                        is_lender=is_bank_or_nbfc(f.get("company_name") or ""),
+                    )
+                    results[f["filing_id"]] = {"category": cat, "materiality": mat, "summary": NO_DETAIL_SUMMARY}
+                    continue
+                entry["pdf_page1_excerpt"] = excerpt
+            payload.append(entry)
+        if not payload:
+            continue
         prompt = f"""You are a senior Indian public-markets equity analyst filtering NSE/BSE corporate filings.
 For each filing in the input JSON array, classify it and return a JSON array of objects with exact keys:
 - "filing_id": string (matching input)
@@ -302,12 +331,16 @@ For each filing in the input JSON array, classify it and return a JSON array of 
   Set materiality=1 ONLY if the event can materially impact stock valuation, operations, or governance (e.g. quarterly/annual financial results, M&A/divestment/stake sale, CEO/CFO/MD/Director appointment or resignation, fund raise, major capex, credit rating change, significant litigation/fine, dividend/bonus/split, insider trading, promoter pledging, or actual earnings call transcript/recording).
   Set materiality=0 for routine noise (newspaper advertisements, loss of share certificates, duplicate share issuance, ESOP allotments, trading window closures, Regulation 74(5) certificates, scheduled 1-on-1 investor/analyst meet notices, routine AGM/postal ballot notices).
 - "summary": A crisp, no-fluff 1-line summary (max 18 words) stating WHAT happened and WHY an investor cares. No filler phrases like "The company informed the exchange that".
+  Some filings carry "pdf_page1_excerpt", the start of the attached PDF. Use it to state the actual event (who, what role, amount, date).
+  Only state facts present in the title or excerpt. Never guess ("likely concerning ...") and never write generic filler such as "impacts leadership and strategic direction".
+  If neither the title nor the excerpt says what happened, the summary must be exactly: "{NO_DETAIL_SUMMARY}"
 
 Input filings:
 {json.dumps(payload, ensure_ascii=False)}
 """
         try:
-            title_by_id = {f["filing_id"]: f.get("title", "") for f in batch}
+            title_by_id = {e["filing_id"]: e["title"] for e in payload}
+            lender_by_id = {f["filing_id"]: is_bank_or_nbfc(f.get("company_name") or "") for f in batch}
             parsed = _call_gemini_json(
                 prompt=prompt,
                 model=MODEL_FLASH_LITE,
@@ -318,18 +351,16 @@ Input filings:
             items = parsed if isinstance(parsed, list) else parsed.get("items", [])
             for item in items:
                 fid = item.get("filing_id")
-                if not fid:
+                summary = (item.get("summary") or "").strip()
+                # No summary (or an id we didn't send) = not triaged; the row stays blank and is retried next refresh
+                if fid not in title_by_id or not summary:
                     continue
                 cat = item.get("category", "unclassified")
                 if cat not in VALID_CATEGORIES:
                     cat = "unclassified"
                 mat = 1 if int(item.get("materiality", 0)) == 1 else 0
-                cat, mat = enforce_filing_hygiene(title_by_id.get(fid, ""), cat, mat)
-                results[fid] = {
-                    "category": cat,
-                    "materiality": mat,
-                    "summary": (item.get("summary") or "").strip(),
-                }
+                cat, mat = enforce_filing_hygiene(title_by_id[fid], cat, mat, is_lender=lender_by_id[fid])
+                results[fid] = {"category": cat, "materiality": mat, "summary": summary}
         except Exception as exc:
             print(f"[llm_router] Batch triage error: {exc}")
 

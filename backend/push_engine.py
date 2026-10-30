@@ -6,7 +6,13 @@ from typing import Any
 
 from backend.db import get_conn, get_portfolio, get_alert_rules, DB_PATH
 from backend.scrapers.market_data import fetch_eod_metrics
-from backend.scrapers.filings import fetch_company_filings, enforce_filing_hygiene
+from backend.scrapers.filings import (
+    PERSON_HONORIFIC,
+    enforce_filing_hygiene,
+    fetch_company_filings,
+    is_bank_or_nbfc,
+    is_vague_title,
+)
 from backend.llm_router import (
     latest_model_for,
     classify_and_summarize_batch,
@@ -21,6 +27,10 @@ WINDOW_HOURS = {
     "14d": 24 * 14,
     "30d": 24 * 30,
 }
+
+# ponytail: hard cap of 20 x 15 = 300 filings per refresh; the rest wait for the next refresh
+TRIAGE_BATCH_SIZE = 15
+MAX_TRIAGE_BATCHES = 20
 
 CATEGORY_PRIORITY = {
     "results": 1,
@@ -109,27 +119,29 @@ def refresh_portfolio_push_data(
         items = fetch_company_filings(p["ticker"], bse_code=p["bse_code"], days=days, db_path=db_path, save_to_db=True)
         scraped_count += len(items)
 
-    # Find filings that need LLM triage (summary is NULL or empty)
+    # Triage every filing with a blank summary, including rows Pull saved for stocks outside the portfolio.
+    # A refresh scoped to `tickers` triages only those stocks.
     with get_conn(db_path) as conn:
-        if ticker_list:
-            placeholders = ",".join("?" for _ in ticker_list)
-            untriaged_rows = conn.execute(
-                f"""
-                SELECT * FROM announcements
-                WHERE (summary IS NULL OR summary = '')
-                  AND ticker IN ({placeholders})
-                ORDER BY published_at DESC
-                LIMIT 60
-                """,
-                ticker_list,
-            ).fetchall()
-        else:
-            untriaged_rows = []
-        untriaged = [dict(r) for r in untriaged_rows]
+        where = "(summary IS NULL OR summary = '')"
+        params: list[Any] = []
+        if tickers:
+            where += f" AND ticker IN ({','.join('?' for _ in ticker_list)})"
+            params = ticker_list
+        untriaged = [
+            dict(r)
+            for r in conn.execute(f"SELECT * FROM announcements WHERE {where} ORDER BY published_at DESC", params)
+        ]
 
-    triaged_map = classify_and_summarize_batch(untriaged, db_path=db_path) if untriaged else {}
-
-    if triaged_map:
+    # Each filing is tried at most once per refresh; failures stay blank for the next refresh, and a batch with
+    # no progress (LLM down, budget hit) stops the loop so a failing filing can't keep spending.
+    triaged_count = 0
+    max_rows = MAX_TRIAGE_BATCHES * TRIAGE_BATCH_SIZE
+    for i in range(0, min(len(untriaged), max_rows), TRIAGE_BATCH_SIZE):
+        triaged_map = classify_and_summarize_batch(
+            untriaged[i : i + TRIAGE_BATCH_SIZE], db_path=db_path, batch_size=TRIAGE_BATCH_SIZE
+        )
+        if not triaged_map:
+            break
         with get_conn(db_path) as conn:
             for fid, tdata in triaged_map.items():
                 conn.execute(
@@ -140,6 +152,7 @@ def refresh_portfolio_push_data(
                     """,
                     (tdata["category"], tdata["materiality"], tdata["summary"], fid),
                 )
+        triaged_count += len(triaged_map)
 
     # Enrich material 'results' and 'management_change' filings that haven't been enriched yet
     with get_conn(db_path) as conn:
@@ -170,7 +183,8 @@ def refresh_portfolio_push_data(
         "stocks_refreshed": len(ticker_list),
         "eod_updated": len(eod_metrics),
         "filings_checked": scraped_count,
-        "filings_triaged_by_llm": len(triaged_map),
+        "filings_triaged_by_llm": triaged_count,
+        "filings_left_untriaged": len(untriaged) - triaged_count,
         "filings_deep_enriched": enriched_count,
     }
 
@@ -178,7 +192,8 @@ def refresh_portfolio_push_data(
 def _format_announcement_row(row: Any) -> dict[str, Any]:
     d = dict(row)
     cat, mat = enforce_filing_hygiene(
-        d.get("title", ""), d.get("category", "unclassified"), int(d.get("materiality", 0))
+        d.get("title", ""), d.get("category", "unclassified"), int(d.get("materiality", 0)),
+        is_lender=is_bank_or_nbfc(d.get("company_name") or ""),
     )
     d["category"] = cat
     d["materiality"] = mat
@@ -194,17 +209,33 @@ def _format_announcement_row(row: Any) -> dict[str, Any]:
     return d
 
 
-def _richness_score(item: dict[str, Any]) -> tuple[int, int, float]:
-    """
-    Ranks duplicate filings for the same corporate event so the most informative card wins.
-    """
+_PERSON_ACTION = re.compile(r"\b(?:retire\w*|appoint\w*|resign\w*|cessation)\b")
+
+
+def _enrichment_richness(item: dict[str, Any]) -> tuple[int, int]:
+    """(has payload + has metrics/source link, number of filled fields)."""
     enr = item.get("enriched") or {}
-    has_enr = 1 if enr else 0
     has_source_or_metrics = 1 if (enr.get("metrics") or enr.get("source_url")) else 0
-    is_board_outcome = 1 if "outcome of board meeting" in (item.get("title") or "").lower() else 0
+    filled = sum(1 for v in enr.values() if v not in (None, "", [], {}, "Unknown"))
+    return (int(bool(enr)) + has_source_or_metrics, filled)
+
+
+def _primary_score(item: dict[str, Any]) -> tuple[Any, ...]:
+    """
+    Ranks duplicate filings for the same corporate event so the most informative title becomes the card:
+    2 = names a person and what happened to them, 1 = a specific subject, 0 = a generic filing type
+    ("Change in Director(s)"). Ties go to the richer enrichment, a board outcome, the longer title, then the newest.
+    """
+    title = (item.get("title") or "").lower()
+    if PERSON_HONORIFIC.search(title) and _PERSON_ACTION.search(title):
+        specificity = 2
+    else:
+        specificity = 0 if is_vague_title(title) else 1
     return (
-        has_enr + has_source_or_metrics,
-        is_board_outcome,
+        specificity,
+        _enrichment_richness(item),
+        1 if "outcome of board meeting" in title else 0,
+        len(title),
         _ts_epoch(item.get("published_at", "")),
     )
 
@@ -215,10 +246,10 @@ def _deduplicate_material_filings(
     """
     Deduplicates multiple NSE/BSE exchange filings for the same stock and event
     (e.g. TRENT Harish Bhat resignation filed twice, or Outcome of Board Meeting + Auditor Report for same results).
-    Returns (deduped_material, collapsed_duplicates).
+    The primary card keeps the richest enrichment in its group and lists the others in `also_filed_as`.
+    Returns (deduped_material, folded_duplicates).
     """
-    best_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
-    duplicates: list[dict[str, Any]] = []
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
 
     for item in material:
         ticker = item.get("ticker", "")
@@ -242,17 +273,23 @@ def _deduplicate_material_filings(
             norm_prefix = re.sub(r"[^a-z0-9]", "", title_low)[:36]
             key = (ticker, cat, date_day, norm_prefix)
 
-        existing = best_by_key.get(key)
-        if existing is None:
-            best_by_key[key] = item
-        else:
-            if _richness_score(item) > _richness_score(existing):
-                duplicates.append(existing)
-                best_by_key[key] = item
-            else:
-                duplicates.append(item)
+        groups.setdefault(key, []).append(item)
 
-    deduped = list(best_by_key.values())
+    deduped: list[dict[str, Any]] = []
+    duplicates: list[dict[str, Any]] = []
+    for group in groups.values():
+        primary = max(group, key=_primary_score)
+        richest = max(group, key=_enrichment_richness)
+        if _enrichment_richness(richest) > _enrichment_richness(primary):
+            primary["enriched"] = richest["enriched"]
+        others = [x for x in group if x is not primary]
+        if others:
+            primary["also_filed_as"] = [
+                {k: x.get(k) for k in ("filing_id", "title", "pdf_url", "published_at")} for x in others
+            ]
+        deduped.append(primary)
+        duplicates.extend(others)
+
     deduped.sort(key=lambda x: (x["priority_rank"], -_ts_epoch(x["published_at"])))
     return deduped, duplicates
 
@@ -322,11 +359,11 @@ def get_windowed_digest(
     raw_material = [x for x in all_items if x["materiality"] == 1]
     routine = [x for x in all_items if x["materiality"] == 0]
 
-    material, collapsed_dups = _deduplicate_material_filings(raw_material)
-    routine = collapsed_dups + routine
+    # Duplicates are folded into their primary card's "Also filed as" note, not shown in the routine drawer
+    material, folded_dups = _deduplicate_material_filings(raw_material)
 
     total = len(all_items)
-    noise_pct = round((len(routine) / total) * 100, 1) if total > 0 else 0.0
+    noise_pct = round(((len(routine) + len(folded_dups)) / total) * 100, 1) if total > 0 else 0.0
 
     return {
         "window": window,
@@ -335,6 +372,7 @@ def get_windowed_digest(
             "total_filings": total,
             "material_count": len(material),
             "routine_collapsed_count": len(routine),
+            "duplicates_merged": len(folded_dups),
             "noise_filtered_pct": noise_pct,
             # Model that served the latest LLM triage batch (None = only the regex classifier has run)
             "triage_model": latest_model_for("push_batch_triage", db_path=db_path),

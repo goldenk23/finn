@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.stdout.reconfigure(encoding="utf-8")
 
 from backend.db import init_db, get_portfolio, get_conn
-from backend.scrapers.filings import enforce_filing_hygiene
+from backend.scrapers.filings import enforce_filing_hygiene, is_bank_or_nbfc
 from backend.push_engine import refresh_portfolio_push_data, get_windowed_digest, enrich_single_filing
 from backend.pull_engine import get_or_generate_pull_report
 from backend.llm_router import (
@@ -36,7 +36,9 @@ def sanitize_and_repair_announcements() -> None:
     for r in rows:
         fid = r["filing_id"]
         old_cat, old_mat = r["category"], int(r["materiality"])
-        new_cat, new_mat = enforce_filing_hygiene(r["title"], old_cat, old_mat)
+        new_cat, new_mat = enforce_filing_hygiene(
+            r["title"], old_cat, old_mat, is_lender=is_bank_or_nbfc(r["company_name"] or "")
+        )
         should_clear_enr = new_mat == 0 or new_cat not in ("results", "management_change")
         new_enr_json = "{}" if should_clear_enr else (r["enriched_json"] or "{}")
         if (new_cat, new_mat, new_enr_json) != (old_cat, old_mat, r["enriched_json"] or "{}"):

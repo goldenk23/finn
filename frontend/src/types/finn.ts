@@ -49,6 +49,8 @@ export interface FilingItem {
   priority_rank: number;
   enriched?: ResultsEnrichment & ManagementEnrichment & Record<string, unknown>;
   trigger_reason?: string;
+  /** Other exchange filings for the same event, folded into this card by the backend dedup. */
+  also_filed_as?: { filing_id: string; title: string; pdf_url?: string; published_at: string }[];
 }
 
 export interface DigestResponse {
@@ -58,6 +60,8 @@ export interface DigestResponse {
     total_filings: number;
     material_count: number;
     routine_collapsed_count: number;
+    /** Duplicate filings folded into a primary card's "Also filed as" note. */
+    duplicates_merged?: number;
     noise_filtered_pct: number;
     /** Model that served the latest LLM triage batch; null if only the regex classifier has run. */
     triage_model?: string | null;

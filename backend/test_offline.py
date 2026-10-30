@@ -761,6 +761,207 @@ def test_results_enrichment_end_to_end() -> None:
             setattr(llm_router, k, v)
 
 
+KPIT_COMFORT = (
+    "Giving guarantees/indemnity/ becoming a surety for third party: KPIT Technologies Limited has informed the Exchange "
+    "about Issue of Letter of Comfort in favor of KPIT Technologies (UK) Limited, a wholly-owned subsidiary of the Company."
+)
+BFL_NCD = (
+    "Allotment of Securities: Bajaj Finance Limited has informed the Exchange regarding allotment of 2,12,000 securities "
+    "pursuant to Non Convertible Securities at its meeting held on October 21, 2026"
+)
+
+
+def test_classifier_rules() -> None:
+    from backend.scrapers.filings import classify_heuristic, is_bank_or_nbfc
+
+    cases = {
+        "Reliance commissions new refinery unit": ("capex", 1),  # "fine" inside "refinery" is not litigation
+        "Disclosure under Regulation 30 of SEBI (LODR) Regulations, 2015": ("unclassified", 0),
+        "GST registration certificate update": ("unclassified", 0),
+        "Intimation of Board Meeting to consider raising funds; Board of Directors to meet": ("unclassified", 0),
+        "Appointment of Statutory Auditors": ("unclassified", 0),
+        "General Updates: Appointment of Statutory Auditors Pursuant to Mandatory Auditor Rotation": ("unclassified", 0),
+        "Appointment of Secretarial Auditor for FY27": ("unclassified", 0),
+        "Appointment of Scrutinizer for Postal Ballot": ("unclassified", 0),
+        "Order received from NHAI for ₹2,000 Cr": ("press_release", 1),
+        "Notice of AGM": ("agm_egm", 0),
+        "Notice of Board Meeting": ("unclassified", 0),
+        KPIT_COMFORT: ("unclassified", 0),
+        "Post Earnings Conference Call of the Company is scheduled on October 28, 2026": ("earnings_call", 1),
+        "Show cause notice received from the GST department": ("litigation", 1),
+        "SEBI levied a fine of ₹5 lakh on the Company": ("litigation", 1),
+        "Receipt of tax demand order of ₹120 Cr": ("litigation", 1),
+        "Retirement of Mr. Noel N Tata as the Chairman": ("management_change", 1),
+        "Change in Director(s)": ("management_change", 1),
+    }
+    for title, want in cases.items():
+        assert classify_heuristic(title) == want, (title, classify_heuristic(title), want)
+
+    # Lenders' routine NCD allotments are not material; a non-financial company's NCD raise is
+    assert is_bank_or_nbfc("Bajaj Finance Limited") and is_bank_or_nbfc("HDFC Bank Limited")
+    assert not is_bank_or_nbfc("Sun Pharmaceutical Industries Limited") and not is_bank_or_nbfc("KPIT Technologies Ltd")
+    assert classify_heuristic(BFL_NCD, is_lender=True) == ("fund_raise", 0)
+    assert classify_heuristic(BFL_NCD.replace("Bajaj Finance", "Sun Pharmaceutical Industries")) == ("fund_raise", 1)
+    assert classify_heuristic("Allotment of Commercial Paper", is_lender=True) == ("fund_raise", 0)
+    assert classify_heuristic("Allotment of equity shares under QIP", is_lender=True) == ("fund_raise", 1)
+
+    # The same guards hold when the LLM returns the wrong material category
+    for title, llm_cat in [
+        ("Appointment of Statutory Auditors", "management_change"),
+        ("Intimation of Board Meeting to consider raising funds; Board of Directors to meet", "management_change"),
+        (KPIT_COMFORT, "fund_raise"),
+    ]:
+        assert enforce_filing_hygiene(title, llm_cat, 1) == ("unclassified", 0), title
+    assert enforce_filing_hygiene(BFL_NCD, "fund_raise", 1, is_lender=True) == ("fund_raise", 0)
+    # An auditor appointment inside a results outcome keeps the results material
+    both = "Outcome of Board Meeting: financial results for Q2 and appointment of secretarial auditors"
+    assert enforce_filing_hygiene(both, "results", 1) == ("results", 1)
+
+
+def test_batch_triage_reads_pdf_for_vague_titles() -> None:
+    sent: dict = {}
+    calls: list = []
+
+    def fake_extract(url, **kw):
+        calls.append((url, kw))
+        return "\n--- [Page 1 of 2] ---\nRetirement of Mr. Noel N Tata as Chairman w.e.f. 11 Nov 2026. " + "x" * 5000 if url == "https://x/a.pdf" else ""
+
+    def fake_llm(prompt, **kw):
+        sent["prompt"] = prompt
+        return [
+            {"filing_id": "a", "category": "management_change", "materiality": 1, "summary": "Noel Tata retires as Chairman."},
+            {"filing_id": "c", "category": "press_release", "materiality": 1, "summary": "Wins ₹2,000 Cr NHAI order."},
+            {"filing_id": "d", "category": "litigation", "materiality": 1, "summary": ""},  # no summary -> not triaged
+            {"filing_id": "zz", "category": "litigation", "materiality": 1, "summary": "invented"},
+        ]
+
+    filings = [
+        {"filing_id": "a", "ticker": "TRENT", "company_name": "Trent Limited", "category": "management_change", "materiality": "1",
+         "title": "Change in Director(s): Trent Limited has informed the Exchange regarding Change in Director(s) of the company.",
+         "pdf_url": "https://x/a.pdf"},
+        {"filing_id": "b", "ticker": "HDFCBANK", "company_name": "HDFC Bank Limited", "category": "unclassified", "materiality": 0,
+         "title": "Disclosure under Regulation 30 of SEBI (LODR) Regulations, 2015", "pdf_url": "https://x/b.pdf"},
+        {"filing_id": "c", "ticker": "LT", "category": "press_release", "materiality": 1,
+         "title": "Order received from NHAI for ₹2,000 Cr", "pdf_url": "https://x/c.pdf"},
+        {"filing_id": "d", "ticker": "LT", "category": "unclassified", "materiality": 0, "title": "Update", "pdf_url": ""},
+    ]
+    orig = llm_router.extract_pdf_text, llm_router._call_gemini_json
+    try:
+        llm_router.extract_pdf_text, llm_router._call_gemini_json = fake_extract, fake_llm
+        out = llm_router.classify_and_summarize_batch(filings)
+    finally:
+        llm_router.extract_pdf_text, llm_router._call_gemini_json = orig
+
+    p = sent["prompt"]
+    assert "Retirement of Mr. Noel N Tata as Chairman" in p and "x" * 1500 not in p, "excerpt missing or not capped"
+    assert "[Page 1" not in p and llm_router.NO_DETAIL_SUMMARY in p
+    assert '"b"' not in p, "a vague filing with no PDF text was sent to the model"
+    assert [u for u, _ in calls] == ["https://x/a.pdf", "https://x/b.pdf"], calls  # only vague titles open the PDF
+    assert all(kw.get("max_pages") == 1 for _, kw in calls)
+    assert out["b"] == {"category": "unclassified", "materiality": 0, "summary": "Filing does not specify details; see attached PDF"}
+    assert out["a"]["summary"] == "Noel Tata retires as Chairman." and out["c"]["category"] == "press_release"
+    assert "d" not in out and "zz" not in out, out
+
+
+def test_triage_loop_covers_all_untriaged_and_stops() -> None:
+    from backend import push_engine
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        db = Path(tmp) / "triage.db"
+        init_db(db)
+        conn = sqlite3.connect(db)
+        rows = [(f"f{i:02d}", "DIXON" if i % 2 else "TRENT", f"Filing {i}", f"2026-10-{1 + i % 28:02d} 10:00:00") for i in range(40)]
+        conn.executemany("INSERT INTO announcements (filing_id, ticker, title, published_at) VALUES (?,?,?,?)", rows)
+        conn.commit()
+        conn.close()
+
+        batches: list[int] = []
+
+        def fake_triage(batch, db_path=None, batch_size=15):
+            batches.append(len(batch))
+            return {f["filing_id"]: {"category": "unclassified", "materiality": 0, "summary": "s"}
+                    for f in batch if f["filing_id"] != "f07"}  # f07 keeps failing
+
+        patches = {"fetch_eod_metrics": lambda *a, **k: [], "fetch_company_filings": lambda *a, **k: [],
+                   "classify_and_summarize_batch": fake_triage}
+        orig = {k: getattr(push_engine, k) for k in patches}
+        orig_max = push_engine.MAX_TRIAGE_BATCHES
+        try:
+            for k, v in patches.items():
+                setattr(push_engine, k, v)
+            out = push_engine.refresh_portfolio_push_data(db_path=db)
+            assert batches == [15, 15, 10], batches  # DIXON (not in portfolio, saved by Pull) is included
+            assert out["filings_triaged_by_llm"] == 39 and out["filings_left_untriaged"] == 1, out
+            conn = sqlite3.connect(db)
+            blank = [r[0] for r in conn.execute("SELECT filing_id FROM announcements WHERE summary IS NULL OR summary = ''")]
+            conn.close()
+            assert blank == ["f07"], blank  # the failed row is not marked as triaged
+
+            # No progress stops the loop after one batch
+            batches.clear()
+            push_engine.classify_and_summarize_batch = lambda batch, **k: batches.append(len(batch)) or {}
+            push_engine.refresh_portfolio_push_data(db_path=db)
+            assert batches == [1], batches
+
+            # Max batch count caps spend
+            conn = sqlite3.connect(db)
+            conn.execute("UPDATE announcements SET summary = NULL")
+            conn.commit()
+            conn.close()
+            batches.clear()
+            push_engine.classify_and_summarize_batch = fake_triage
+            push_engine.MAX_TRIAGE_BATCHES = 2
+            out = push_engine.refresh_portfolio_push_data(db_path=db)
+            assert batches == [15, 15] and out["filings_left_untriaged"] == 11, (batches, out)
+        finally:
+            for k, v in orig.items():
+                setattr(push_engine, k, v)
+            push_engine.MAX_TRIAGE_BATCHES = orig_max
+
+
+def test_dedup_picks_informative_primary_card() -> None:
+    import json
+    from backend import push_engine
+
+    pub = "2026-10-29 16:32:13"
+    bio = {"role": "Chairman and Director", "action": "Retirement", "effective_date": "11th November 2026",
+           "two_line_bio": "b", "source_url": "https://x/web"}
+    rows = [  # the real TRENT pair: same timestamp, enrichment names the same person, vague one comes first
+        ("vague", "management_change", "Change in Director(s): Trent Limited has informed the Exchange regarding Change in Director(s) of the company.",
+         "https://x/cid.pdf", {**bio, "person_name": "Mr. Noel N. Tata"}),
+        ("named", "management_change", "Retirement: Trent Limited has informed the Exchange about Retirement of Mr. Noel N Tata as the Chairman",
+         "https://x/ret.pdf", {**bio, "person_name": "Noel N. Tata"}),
+        # results: the vague board outcome carries the metrics, the press release names the results
+        ("outcome", "results", "Outcome of Board Meeting: Trent Limited has submitted the Outcome of Board Meeting held on October 29, 2026",
+         "https://x/out.pdf", {"metrics": {"pat": {"value": "1"}}, "summary": "PAT up"}),
+        ("press", "results", "Press Release: Trent Limited has informed the Exchange regarding Q2FY27 financial results",
+         "https://x/pr.pdf", {}),
+    ]
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        db = Path(tmp) / "dedup.db"
+        init_db(db)
+        conn = sqlite3.connect(db)
+        conn.executemany(
+            "INSERT INTO announcements (filing_id, ticker, company_name, title, pdf_url, published_at, category, materiality, summary, enriched_json)"
+            " VALUES (?, 'TRENT', 'Trent Limited', ?, ?, ?, ?, 1, 's', ?)",
+            [(fid, title, url, pub, cat, json.dumps(enr)) for fid, cat, title, url, enr in rows],
+        )
+        conn.commit()
+        conn.close()
+        digest = push_engine.get_windowed_digest("30d", tickers=["TRENT"], db_path=db)
+
+    by_id = {x["filing_id"]: x for x in digest["material"]}
+    assert sorted(by_id) == ["named", "press"], sorted(by_id)
+    assert digest["routine"] == [], "duplicates must not land in the routine drawer"
+    assert digest["stats"]["duplicates_merged"] == 2
+    named = by_id["named"]
+    assert [(d["filing_id"], d["pdf_url"]) for d in named["also_filed_as"]] == [("vague", "https://x/cid.pdf")]
+    assert named["enriched"]["person_name"] == "Noel N. Tata", "equal payloads: primary keeps its own"
+    press = by_id["press"]
+    assert press["enriched"]["metrics"] == {"pat": {"value": "1"}}, "primary must take the richest enrichment"
+    assert press["also_filed_as"][0]["filing_id"] == "outcome"
+
+
 if __name__ == "__main__":
     tests = [fn for name, fn in sorted(globals().items()) if name.startswith("test_") and callable(fn)]
     for fn in tests:

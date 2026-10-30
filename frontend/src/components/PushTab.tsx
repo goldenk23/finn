@@ -151,7 +151,9 @@ export function PushTab({
                 <span className="text-zinc-300">
                   {stats.routine_collapsed_count} Routine Filings
                 </span>{" "}
-                collapsed out of {stats.total_filings}
+                collapsed
+                {stats.duplicates_merged ? ` and ${stats.duplicates_merged} duplicates merged` : ""} out of{" "}
+                {stats.total_filings}
               </p>
             </div>
           </div>

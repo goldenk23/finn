@@ -13,85 +13,145 @@ USER_AGENT = (
     "Chrome/131.0.0.0 Safari/537.36"
 )
 
-# ponytail: fast regex-based pre-classifier before LLM triage so basic rule categorization works with zero LLM cost
-CATEGORY_RULES: list[tuple[str, str, int]] = [
-    (r"financial result|un-audited|audited|outcome of board meeting.*result|investor presentation.*q[1-4]|earning", "results", 1),
-    (r"acqui|merger|demerger|amalgamation|joint venture|stake|subsidiary|incorporation|slump sale", "M&A", 1),
-    (r"qip|qualified institutional|preferential|rights issue|buyback|allotment of .*debenture|commercial paper|fund rais", "fund_raise", 1),
-    (r"resign|appoint|cessation|managing director|ceo|cfo|whole-time director|key managerial|board of directors", "management_change", 1),
-    (r"litigation|penalty|fine|order passed|show cause|arbitration|nclt|insolvency|sebi|tax demand|gst", "litigation", 1),
-    (r"sast|insider trading|continual disclosure|regulation 7\(2\)|regulation 29", "insider_trading", 1),
-    (r"earnings call|concall|conference call|audio recording|transcript", "earnings_call", 1),
-    (r"analyst|institutional investor|investor meet|schedule of .*meet", "investor_meetings", 0),
-    (r"credit rating|crisil|icra|care ratings|india ratings|brickwork", "credit_rating", 1),
-    (r"dividend|record date.*dividend", "dividend", 1),
-    (r"bonus|sub-division|stock split", "bonus_split", 1),
-    (r"capacity expansion|capex|new plant|commissioning|commercial production", "capex", 1),
-    (r"press release|media release|bagged.*order|order win|launch|partnership", "press_release", 1),
-    (r"postal ballot", "postal_ballot", 0),
-    (r"annual general meeting|extraordinary general meeting|\bagm\b|\begm\b", "agm_egm", 0),
-    (r"pledge|encumbrance|release of shares", "pledging", 1),
+
+def _wb(pattern: str) -> re.Pattern[str]:
+    """Compile `pattern` so every alternative matches whole words only: "fine" no longer hits "refinery".
+    Same as wrapping in \\b...\\b, but also works when a phrase ends in punctuation, e.g. "regulation 74(5)"."""
+    return re.compile(rf"(?<!\w)(?:{pattern})(?!\w)")
+
+
+def _wb_any(phrases: list[str]) -> re.Pattern[str]:
+    return _wb("|".join(re.escape(p) for p in phrases))
+
+
+# ponytail: fast regex-based pre-classifier before LLM triage so basic rule categorization works with zero LLM cost.
+# First match wins. Stems end in \w* because matching is whole-word.
+CATEGORY_RULES: list[tuple[re.Pattern[str], str, int]] = [
+    (_wb(r"financial results?|un-?audited|audited|outcome of board meeting.*results?|investor presentation.*q[1-4]|earnings?(?! call| conference)"), "results", 1),
+    (_wb(r"acqui\w*|mergers?|demergers?|amalgamation|joint ventures?|stakes?|subsidiar(?:y|ies)|incorporation|slump sale"), "M&A", 1),
+    (_wb(r"qip|qualified institution\w*|preferential|rights issue|buy-?back|allotment of .*debentures?|non[- ]convertible|ncds?|commercial paper|fund rais\w*"), "fund_raise", 1),
+    # No bare "board of directors": board meeting intimations name the board without any change in it
+    (_wb(r"resign\w*|appoint\w*|cessation|retire\w*|managing director|ceo|cfo|whole-?time director|key managerial|change in (?:the )?(?:directors?|management|kmp)"), "management_change", 1),
+    # Phrases only. Bare "sebi"/"gst" hit every Reg 30 / GST registration filing, bare "order" hits order wins, and bare
+    # "notice" hits AGM and board meeting notices.
+    (_wb(r"litigation|lawsuit|penalt(?:y|ies)|levied a fine|imposed a fine|fine of|show[- ]cause notice|demand notice|tax demand|demand order|assessment order|adjudication order|court order|tribunal order|order passed|writ petition|warning letter|arbitration|nclt|insolvency|disputes?"), "litigation", 1),
+    (_wb(r"sast|insider trading|continual disclosure|regulation 7\(2\)|regulation 29"), "insider_trading", 1),
+    (_wb(r"earnings call|concall|conference call|audio recording|transcript"), "earnings_call", 1),
+    (_wb(r"analysts?|institutional investors?|investor meet|schedule of .*meet\w*"), "investor_meetings", 0),
+    (_wb(r"credit rating|crisil|icra|care ratings|india ratings|brickwork"), "credit_rating", 1),
+    (_wb(r"dividends?"), "dividend", 1),
+    (_wb(r"bonus|sub-division|stock split"), "bonus_split", 1),
+    (_wb(r"capacity expansion|capex|new plant|commission(?:s|ed|ing)|commercial production"), "capex", 1),
+    # Order wins are press_release per the ENAM reference ("General news — order wins, new products, partnerships")
+    (_wb(r"press release|media release|orders? received|receipt of (?:an? )?orders?|bagged.*orders?|order wins?|launch\w*|partnerships?"), "press_release", 1),
+    (_wb(r"postal ballot"), "postal_ballot", 0),
+    (_wb(r"annual general meeting|extraordinary general meeting|agm|egm"), "agm_egm", 0),
+    (_wb(r"pledg\w*|encumbrances?|release of shares"), "pledging", 1),
 ]
 
+_ROUTINE_NOISE = _wb_any([
+    "copy of newspaper publication",
+    "newspaper publication",
+    "newspaper advertisement",
+    "newspaper clipping",
+    "newspaper intimation",
+    "certificate under sebi (depositories and participants)",
+    "regulation 74(5)",
+    "loss of share certificate",
+    "duplicate share",
+    "esop",
+    "esops",
+    "employee stock option",
+    "closure of trading window",
+    "trading window",
+    "compliance certificate",
+    "redemption of commercial paper",
+])
+_INVESTOR_MEET = _wb_any([
+    "analysts/institutional investor meet",
+    "analyst/institutional investor meet",
+    "schedule of analyst",
+    "investor meet",
+])
+_RECORDING = _wb_any(["transcript", "audio recording", "link of recording", "video recording"])
+# Generic date phrases: only a prior-notice signal on results rows (an earnings call "is scheduled on" stays a call)
+_RESULTS_DATE_NOTICE = _wb_any(["is scheduled on", "will be held on"])
+_BOARD_MEETING_NOTICE = _wb(
+    r"meeting of the board of directors of the company is scheduled|intimation of (?:the )?board meeting"
+    r"|notice of (?:the )?board meeting|board of directors (?:to|will|shall) meet|board meeting (?:is )?(?:scheduled|to be held)"
+)
+_OUTCOME = _wb_any(["outcome of board meeting"])
+# ENAM puts auditor appointments in `unclassified` (routine paperwork); scrutinizers are AGM/postal ballot admin
+_AUDITOR_APPOINTMENT = _wb(
+    r"(?:re-?)?appoint\w*.*(?:(?:statutory|secretarial|cost|internal)\s+auditors?|scrutini[sz]ers?)"
+    r"|(?:statutory|secretarial|cost|internal)\s+auditors?.*appoint\w*"
+)
+_DEBT_PAPER = _wb(r"non[- ]convertible|ncds?|debentures?|commercial papers?")
+_SUBSIDIARY_SUPPORT = _wb(r"letters? of comfort|comfort letters?|corporate guarantees?|guarantees?|surety")
+_SUBSIDIARY = _wb(r"subsidiar(?:y|ies)")
+# ponytail: name-based lender check. No offline bank/NBFC helper exists (results enrichment reads Screener's
+# "Financing Profit" row over the network), so this misses lenders without these words in their name (e.g. REC Ltd).
+# Upgrade path: store an is_financial flag on the portfolio row from the Screener scrape.
+_LENDER_NAME = _wb(r"banks?|nbfc|finance|financial|fincorp|finserv")
 
-def enforce_filing_hygiene(title: str, category: str, materiality: int) -> tuple[str, int]:
+
+def is_bank_or_nbfc(company_name: str) -> bool:
+    return bool(_LENDER_NAME.search((company_name or "").lower()))
+
+
+# Titles that name the filing type but not the event ("Change in Director(s)", "Disclosure under Reg 30")
+_GENERIC_TITLE = _wb(
+    r"regulation 30|reg\.? 30|outcome of (?:the )?board meeting|change in (?:the )?(?:director\(s\)|directors?|management|kmp)"
+    r"|resignation of director/kmp/smp|general updates?|issue of securities|intimation under sebi|disclosure under"
+)
+PERSON_HONORIFIC = re.compile(r"\b(?:mr|mrs|ms|dr|shri|smt)\b\.?\s+[a-z]")
+_RESULTS_WORD = _wb(r"results?")
+
+
+def is_vague_title(title: str) -> bool:
+    """A generic filing type with no person named and no results mentioned: the event is only in the PDF."""
+    t = (title or "").lower()
+    return bool(_GENERIC_TITLE.search(t)) and not PERSON_HONORIFIC.search(t) and not _RESULTS_WORD.search(t)
+
+
+def enforce_filing_hygiene(title: str, category: str, materiality: int, is_lender: bool = False) -> tuple[str, int]:
     """
     Root-cause guard ensuring routine exchange noise (newspaper clippings, Reg 74(5) depository
-    certificates, trading window closures, analyst meet schedules, prior board meeting notices)
-    is never promoted to materiality=1 by either regex heuristics or LLM triage.
+    certificates, trading window closures, analyst meet schedules, prior board meeting notices,
+    auditor appointments, lenders' routine debt allotments) is never promoted to materiality=1
+    by either regex heuristics or LLM triage. `is_lender`: the filer is a bank/NBFC (see is_bank_or_nbfc).
     """
     t = (title or "").lower()
 
     # 1. Hard routine noise -> always unclassified, materiality=0
-    if any(
-        noise in t
-        for noise in [
-            "copy of newspaper publication",
-            "newspaper publication",
-            "newspaper advertisement",
-            "newspaper clipping",
-            "newspaper intimation",
-            "certificate under sebi (depositories and participants)",
-            "regulation 74(5)",
-            "loss of share certificate",
-            "duplicate share",
-            "esop",
-            "employee stock option",
-            "closure of trading window",
-            "trading window",
-            "compliance certificate",
-            "redemption of commercial paper",
-        ]
-    ):
+    if _ROUTINE_NOISE.search(t):
+        return "unclassified", 0
+    # An auditor appointment bundled into a results outcome must not demote the results
+    if category != "results" and _AUDITOR_APPOINTMENT.search(t):
         return "unclassified", 0
 
+    # A letter of comfort / guarantee for a subsidiary raises no money from outside investors (ENAM's fund_raise) and
+    # moves no money into the subsidiary (ENAM's M&A "investing in a subsidiary"). It is a contingent liability that
+    # Pull's balance-sheet module picks up from the annual report, so in the feed it is routine paperwork.
+    if _SUBSIDIARY_SUPPORT.search(t) and _SUBSIDIARY.search(t):
+        return "unclassified", 0
+
+    # Banks and NBFCs issue NCDs / commercial paper every week as their lending raw material: routine for them.
+    # A non-financial company's NCD issue stays a material fund_raise.
+    if is_lender and category == "fund_raise" and _DEBT_PAPER.search(t):
+        return "fund_raise", 0
+
     # 2. Analyst / Investor Meet updates: only material if it is an actual Transcript or Recording
-    if any(
-        k in t
-        for k in [
-            "analysts/institutional investor meet",
-            "analyst/institutional investor meet",
-            "schedule of analyst",
-            "investor meet",
-        ]
-    ):
-        if any(rec in t for rec in ["transcript", "audio recording", "link of recording", "video recording"]):
+    if _INVESTOR_MEET.search(t):
+        if _RECORDING.search(t):
             return "earnings_call", 1
         return "investor_meetings", 0
 
-    # 3. Prior board meeting date intimations vs actual quarterly financial results
-    if category == "results":
-        if ("jio platforms" in t or "initial public offer" in t) and "outcome of board meeting" not in t:
+    # 3. Prior board meeting date intimations (for results, fund raising or anything else) are routine
+    if not _OUTCOME.search(t):
+        if category == "results" and ("jio platforms" in t or "initial public offer" in t):
             return "fund_raise", 1
-        if any(
-            prior in t
-            for prior in [
-                "is scheduled on",
-                "will be held on",
-                "meeting of the board of directors of the company is scheduled",
-                "intimation of board meeting",
-            ]
-        ) and "outcome of board meeting" not in t:
+        if _BOARD_MEETING_NOTICE.search(t) or (category == "results" and _RESULTS_DATE_NOTICE.search(t)):
             return "unclassified", 0
 
     if category in ("unclassified", "investor_meetings", "postal_ballot", "agm_egm"):
@@ -100,15 +160,15 @@ def enforce_filing_hygiene(title: str, category: str, materiality: int) -> tuple
     return category, materiality
 
 
-def classify_heuristic(title: str, desc: str = "") -> tuple[str, int]:
+def classify_heuristic(title: str, desc: str = "", is_lender: bool = False) -> tuple[str, int]:
     full_title = f"{title}: {desc}" if desc and desc != title else title
     text = full_title.lower()
     cat, mat = "unclassified", 0
     for pattern, c, m in CATEGORY_RULES:
-        if re.search(pattern, text):
+        if pattern.search(text):
             cat, mat = c, m
             break
-    return enforce_filing_hygiene(full_title, cat, mat)
+    return enforce_filing_hygiene(full_title, cat, mat, is_lender=is_lender)
 
 
 def _make_filing_id(ticker: str, title: str, pub_dt: str, pdf_url: str) -> str:
@@ -165,7 +225,7 @@ def fetch_nse_announcements(ticker: str, days: int = 10) -> list[dict[str, Any]]
                     except ValueError:
                         continue
 
-                cat, materiality = classify_heuristic(subject, att_text)
+                cat, materiality = classify_heuristic(subject, att_text, is_lender=is_bank_or_nbfc(company_name))
                 filing_id = _make_filing_id(clean_ticker, title, pub_iso, pdf_url)
                 items.append(
                     {
@@ -222,7 +282,7 @@ def fetch_bse_announcements(ticker: str, bse_code: str, days: int = 10) -> list[
                 pub_raw = (row.get("NEWS_DT") or "").replace("T", " ")[:19]
                 company_name = (row.get("SLONGNAME") or clean_ticker).strip()
 
-                cat, materiality = classify_heuristic(headline, more)
+                cat, materiality = classify_heuristic(headline, more, is_lender=is_bank_or_nbfc(company_name))
                 filing_id = _make_filing_id(clean_ticker, title, pub_raw, pdf_url)
                 items.append(
                     {
