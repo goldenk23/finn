@@ -99,6 +99,7 @@ export function FilingCard({
   compact = false,
 }: FilingCardProps) {
   const [enriching, setEnriching] = useState(false);
+  const [enrichError, setEnrichError] = useState<string | null>(null);
   const [localEnriched, setLocalEnriched] = useState<Record<string, unknown> | undefined>(
     filing.enriched
   );
@@ -125,11 +126,12 @@ export function FilingCard({
   async function handleEnrich() {
     try {
       setEnriching(true);
+      setEnrichError(null);
       const res = await finnApi.enrichFiling(filing.filing_id);
       setLocalEnriched(res.enriched);
       onEnriched?.(filing.filing_id, res.enriched);
-    } catch {
-      // ignore error in UI
+    } catch (err) {
+      setEnrichError(err instanceof Error ? err.message : "Enrichment failed.");
     } finally {
       setEnriching(false);
     }
@@ -337,6 +339,11 @@ export function FilingCard({
               )}
               <span>{enriching ? "Extracting..." : "Deep Enrich"}</span>
             </button>
+          )}
+          {enrichError && (
+            <span role="alert" className="text-[10px] text-amber-300">
+              {enrichError}
+            </span>
           )}
         </div>
 

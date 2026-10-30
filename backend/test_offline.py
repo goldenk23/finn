@@ -1,11 +1,18 @@
 """Offline checks: no network, no LLM calls, never writes finn.db. Run with: python backend/test_offline.py"""
+import os
 import sqlite3
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from fastapi import HTTPException
+from fastapi.testclient import TestClient
+from starlette.requests import Request
+
+from backend import main
 from backend.db import DB_PATH, SEED_PORTFOLIO, init_db, normalize_ticker
 from backend.scrapers.filings import enforce_filing_hygiene
 
@@ -108,6 +115,90 @@ def test_deleted_stock_survives_init_db() -> None:
         assert conn.execute("SELECT COUNT(*) FROM portfolio WHERE ticker = 'ITC'").fetchone()[0] == 0, "ITC was re-seeded"
         assert conn.execute("SELECT COUNT(*) FROM portfolio").fetchone()[0] == len(SEED_PORTFOLIO) - 1
         conn.close()
+
+
+@contextmanager
+def _env(**values: str | None):
+    old = {k: os.environ.get(k) for k in values}
+    try:
+        for k, v in values.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _expect_http(status: int, fn, *args) -> None:
+    try:
+        fn(*args)
+    except HTTPException as exc:
+        assert exc.status_code == status, f"expected {status}, got {exc.status_code}: {exc.detail}"
+        return
+    raise AssertionError(f"expected HTTP {status}, nothing raised")
+
+
+def test_daily_budget_cap_counts_only_today() -> None:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        db = Path(tmp) / "ledger.db"
+        init_db(db)
+        conn = sqlite3.connect(db)
+        ins = "INSERT INTO llm_cost_ledger (workflow, model, tokens_in, tokens_out, cost_usd, created_at) VALUES ('t','m',1,1,?,{})"
+        conn.execute(ins.format("datetime('now')"), (0.06,))
+        conn.execute(ins.format("datetime('now')"), (0.05,))
+        conn.execute(ins.format("datetime('now','-1 day')"), (10.0,))  # yesterday: must not count
+        conn.commit()
+        conn.close()
+
+        assert abs(main._spent_today_usd(db) - 0.11) < 1e-9, main._spent_today_usd(db)
+        with _env(FINN_DAILY_BUDGET_USD="0.10"):
+            _expect_http(429, main._enforce_daily_budget, db)
+        with _env(FINN_DAILY_BUDGET_USD="0.50"):
+            main._enforce_daily_budget(db)  # under budget: no exception
+
+
+def test_rate_limit_sliding_window() -> None:
+    main._rate_hits.clear()
+    key = "pull:1.2.3.4"
+    assert [main._rate_limit_retry_after(key, 3, now=t) for t in (0, 1, 2)] == [0, 0, 0]
+    wait = main._rate_limit_retry_after(key, 3, now=3)
+    assert 3590 < wait <= 3601, wait  # blocked until the t=0 hit ages out
+    assert main._rate_limit_retry_after("pull:5.6.7.8", 3, now=3) == 0  # other IPs unaffected
+    assert main._rate_limit_retry_after(key, 3, now=3600.5) == 0  # t=0 hit expired, slot free
+    main._rate_hits.clear()
+
+
+def test_client_ip_ignores_spoofed_forwarded_for() -> None:
+    req = Request({"type": "http", "headers": [(b"x-forwarded-for", b"6.6.6.6, 1.2.3.4")], "client": ("10.0.0.1", 5000)})
+    with _env(FINN_PROXY_HOPS="1"):
+        assert main._client_ip(req) == "1.2.3.4"  # entry appended by the trusted proxy, not the spoofed one
+    with _env(FINN_PROXY_HOPS=None):
+        assert main._client_ip(req) == "10.0.0.1"  # no proxy configured: socket peer
+
+
+def test_paid_endpoints_are_guarded() -> None:
+    # Budget 0 means any paid path must 429 before reaching the LLM. No `with` block, so lifespan/init_db don't run.
+    client = TestClient(main.app)
+    main._rate_hits.clear()
+    with _env(FINN_DAILY_BUDGET_USD="0", FINN_ADMIN_TOKEN="t0k"):
+        admin = {"X-Admin-Token": "t0k"}
+        assert client.post("/api/push/refresh", json={}).status_code == 401
+        assert client.post("/api/push/refresh", json={}, headers={"X-Admin-Token": "nope"}).status_code == 401
+        assert client.post("/api/push/refresh", json={}, headers=admin).status_code == 429
+        assert client.post("/api/push/refresh", json={"max_enrich": 500}, headers=admin).status_code == 422
+        assert client.post("/api/push/enrich/abc", headers=admin).status_code == 429
+        assert client.get("/api/pull/TRENT?force=true").status_code == 401
+        assert client.get("/api/pull/ZZTESTCO").status_code == 429  # uncached -> would cost money
+        assert client.post("/api/pull/ZZTESTCO/ask", json={"question": "q"}).status_code == 429
+        r = client.get("/api/pull/TRENT")  # cached report costs $0, so it is served even with no budget
+        assert r.status_code == 200 and r.json()["cached"] is True, r.status_code
+    main._rate_hits.clear()
 
 
 if __name__ == "__main__":

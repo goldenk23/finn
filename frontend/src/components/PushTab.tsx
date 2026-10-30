@@ -23,6 +23,7 @@ interface PushTabProps {
   onChangeWindow: (w: TimeWindow) => void;
   onChangeTicker: (t: string | null) => void;
   onRefreshLive: () => void;
+  refreshError?: string | null;
   onOpenPull: (ticker: string) => void;
   onFilingEnriched: (filingId: string, enriched: Record<string, unknown>) => void;
 }
@@ -39,6 +40,7 @@ export function PushTab({
   onChangeWindow,
   onChangeTicker,
   onRefreshLive,
+  refreshError,
   onOpenPull,
   onFilingEnriched,
 }: PushTabProps) {
@@ -84,6 +86,14 @@ export function PushTab({
           <span>{refreshing ? "Scraping NSE/BSE..." : "Refresh Live"}</span>
         </button>
       </div>
+      {refreshError && (
+        <p
+          role="alert"
+          className="-mt-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-[11px] text-amber-300"
+        >
+          {refreshError}
+        </p>
+      )}
 
       {/* Horizontal Portfolio Ticker Filter Chips */}
       <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-1">

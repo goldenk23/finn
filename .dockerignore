@@ -1,0 +1,29 @@
+# Secrets
+.env
+.env.*
+
+# VCS, logs, scratch
+.git
+.runtime
+tmp
+*.log
+
+# Caches and build output (rebuilt inside the image)
+backend/cache_pdfs
+**/__pycache__
+**/*.py[cod]
+**/node_modules
+**/.next
+frontend/out
+*.tsbuildinfo
+
+# SQLite side files (finn.db itself is baked in as the pre-warmed demo DB)
+**/*.db-shm
+**/*.db-wal
+
+# Not needed at runtime
+*.pdf
+*.md
+docs
+Dockerfile
+.dockerignore

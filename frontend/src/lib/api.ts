@@ -10,7 +10,8 @@ import {
   TimeWindow,
 } from "@/types/finn";
 
-// ponytail: use Next.js /api rewrite proxy by default so browser calls same-origin, with direct localhost:8000 fallback if needed.
+// ponytail: same-origin by default (Next dev rewrite locally, FastAPI-served static export in prod), with direct localhost:8000 fallback if needed.
+// NEXT_PUBLIC_API_URL is the single backend-location env var, also read by next.config.mjs.
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {

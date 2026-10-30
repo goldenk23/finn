@@ -41,6 +41,7 @@ export default function FinnAppPage() {
   const [digest, setDigest] = useState<DigestResponse | null>(null);
   const [digestLoading, setDigestLoading] = useState<boolean>(true);
   const [refreshingPush, setRefreshingPush] = useState<boolean>(false);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
 
   // Alerts state
   const [alertsData, setAlertsData] = useState<AlertsResponse | null>(null);
@@ -171,6 +172,7 @@ export default function FinnAppPage() {
   async function handleRefreshLivePush() {
     try {
       setRefreshingPush(true);
+      setRefreshError(null);
       await finnApi.refreshPush(
         digestTicker ? [digestTicker] : undefined,
         14,
@@ -182,6 +184,8 @@ export default function FinnAppPage() {
         loadPortfolio(),
         loadTelemetryAndCache(),
       ]);
+    } catch (err) {
+      setRefreshError(err instanceof Error ? err.message : "Live refresh failed.");
     } finally {
       setRefreshingPush(false);
     }
@@ -303,6 +307,7 @@ export default function FinnAppPage() {
               digest={digest}
               loading={digestLoading}
               refreshing={refreshingPush}
+              refreshError={refreshError}
               window={digestWindow}
               selectedTicker={digestTicker}
               portfolio={portfolio}
