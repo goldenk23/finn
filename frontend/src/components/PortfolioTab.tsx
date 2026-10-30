@@ -34,6 +34,7 @@ export function PortfolioTab({
   const [newTicker, setNewTicker] = useState("");
   const [newSector, setNewSector] = useState("Equities");
   const [adding, setAdding] = useState(false);
+  const [addError, setAddError] = useState<string | null>(null);
   const [removingTicker, setRemovingTicker] = useState<string | null>(null);
 
   async function handleAdd(e: React.FormEvent) {
@@ -42,8 +43,11 @@ export function PortfolioTab({
     if (!clean) return;
     try {
       setAdding(true);
+      setAddError(null);
       await onAddStock(clean, newSector);
       setNewTicker("");
+    } catch (err) {
+      setAddError(err instanceof Error ? err.message : "Could not add this stock.");
     } finally {
       setAdding(false);
     }
@@ -106,7 +110,13 @@ export function PortfolioTab({
         <input
           type="text"
           value={newTicker}
-          onChange={(e) => setNewTicker(e.target.value)}
+          onChange={(e) => {
+            setNewTicker(e.target.value);
+            setAddError(null);
+          }}
+          aria-label="NSE ticker to add"
+          aria-invalid={addError ? true : undefined}
+          aria-describedby={addError ? "add-stock-error" : undefined}
           placeholder="Add NSE ticker (e.g. DIXON, BEL)..."
           className="flex-1 rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-1.5 text-xs font-mono text-white placeholder-zinc-500 focus:border-emerald-500 focus:outline-none"
         />
@@ -136,6 +146,15 @@ export function PortfolioTab({
           <span>Add</span>
         </button>
       </form>
+      {addError && (
+        <p
+          id="add-stock-error"
+          role="alert"
+          className="-mt-2 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-1.5 text-[11px] text-rose-300"
+        >
+          {addError}
+        </p>
+      )}
 
       {/* Dense Institutional Watchlist */}
       <div className="space-y-2">

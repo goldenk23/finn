@@ -72,9 +72,10 @@ def _friendly_upstream_error(context: str, exc: Exception) -> HTTPException:
         detail=f"{context} is temporarily unavailable. Check backend logs for details.",
     )
 
-from backend.db import init_db, get_conn, get_portfolio, get_alert_rules, DB_PATH
+from backend.db import init_db, get_conn, get_portfolio, get_alert_rules, normalize_ticker, DB_PATH
 from backend.scrapers.market_data import fetch_eod_metrics
 from backend.scrapers.filings import fetch_company_filings
+from backend.scrapers.screener import fetch_screener_fundamentals
 from backend.push_engine import (
     refresh_portfolio_push_data,
     get_windowed_digest,
@@ -83,6 +84,13 @@ from backend.push_engine import (
 )
 from backend.pull_engine import get_or_generate_pull_report, ask_pull_copilot
 from backend.llm_router import get_cost_summary
+
+
+def _ticker_or_400(raw: str) -> str:
+    try:
+        return normalize_ticker(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @asynccontextmanager
@@ -180,28 +188,44 @@ def api_get_portfolio() -> dict[str, Any]:
 
 @app.post("/api/portfolio")
 def api_add_portfolio_stock(req: AddPortfolioTickerRequest) -> dict[str, Any]:
-    clean = req.ticker.upper().replace(".NS", "").replace(".BO", "").strip()
-    if not clean:
-        raise HTTPException(status_code=400, detail="Ticker is required")
+    clean = _ticker_or_400(req.ticker)
 
-    company_name = req.company_name.strip() or clean
+    # Look the symbol up on Screener so we store the real company name and BSE code, not the raw ticker.
+    company_name, bse_code = req.company_name.strip(), req.bse_code.strip()
+    try:
+        info = fetch_screener_fundamentals(clean)
+        company_name = info.get("company_name") or company_name
+        bse_code = bse_code or info.get("bse_code", "")
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"{clean} was not found on Screener.in. Check the NSE symbol.")
+    except Exception as exc:
+        # Screener unreachable: still add the stock rather than block the user on a transient outage.
+        logger.warning("Screener lookup failed for %s: %s", clean, _sanitize_log_message(str(exc)))
+
     with get_conn() as conn:
         conn.execute(
             """
             INSERT OR REPLACE INTO portfolio (ticker, bse_code, company_name, sector, cap_tier)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (clean, req.bse_code.strip(), company_name, req.sector.strip(), req.cap_tier.strip()),
+            (clean, bse_code, company_name or clean, req.sector.strip(), req.cap_tier.strip()),
         )
 
     eod = fetch_eod_metrics([clean], save_to_db=True)
-    filings = fetch_company_filings(clean, bse_code=req.bse_code.strip(), days=14, save_to_db=True)
-    return {"status": "added", "ticker": clean, "eod": eod, "filings_fetched": len(filings)}
+    filings = fetch_company_filings(clean, bse_code=bse_code, days=14, save_to_db=True)
+    return {
+        "status": "added",
+        "ticker": clean,
+        "company_name": company_name or clean,
+        "bse_code": bse_code,
+        "eod": eod,
+        "filings_fetched": len(filings),
+    }
 
 
 @app.delete("/api/portfolio/{ticker}")
 def api_remove_portfolio_stock(ticker: str) -> dict[str, Any]:
-    clean = ticker.upper().replace(".NS", "").replace(".BO", "").strip()
+    clean = _ticker_or_400(ticker)
     with get_conn() as conn:
         conn.execute("DELETE FROM portfolio WHERE ticker = ?", (clean,))
     return {"status": "removed", "ticker": clean}
@@ -212,14 +236,14 @@ def api_get_digest(
     window: str = Query("7d", description="Time window: 24h, 48h, 7d, 14d, 30d"),
     ticker: str | None = Query(None, description="Optional single ticker filter"),
 ) -> dict[str, Any]:
-    tickers = [ticker] if ticker else None
+    tickers = [_ticker_or_400(ticker)] if ticker else None
     return get_windowed_digest(window=window, tickers=tickers)
 
 
 @app.post("/api/push/refresh")
 def api_refresh_push(req: RefreshRequest) -> dict[str, Any]:
     stats = refresh_portfolio_push_data(
-        tickers=req.tickers,
+        tickers=[_ticker_or_400(t) for t in req.tickers] if req.tickers else None,
         days=req.days,
         max_enrich=req.max_enrich,
     )
@@ -239,7 +263,7 @@ def api_get_alerts(
     window: str = Query("14d", description="Time window for material filing alerts"),
     ticker: str | None = Query(None),
 ) -> dict[str, Any]:
-    tickers = [ticker] if ticker else None
+    tickers = [_ticker_or_400(ticker)] if ticker else None
     return get_triggered_alerts(window=window, tickers=tickers)
 
 
@@ -284,6 +308,7 @@ def api_get_pull_report(
     ticker: str,
     force: bool = Query(False, description="Force fresh scrape and Gemini synthesis"),
 ) -> dict[str, Any]:
+    ticker = _ticker_or_400(ticker)
     try:
         data = get_or_generate_pull_report(ticker=ticker, force_refresh=force)
         # Attach latest EOD price row if available
@@ -302,11 +327,12 @@ def api_get_pull_report(
     except HTTPException:
         raise
     except Exception as exc:
-        raise _friendly_upstream_error(f"Pull research ({ticker.upper()})", exc)
+        raise _friendly_upstream_error(f"Pull research ({ticker})", exc)
 
 
 @app.post("/api/pull/{ticker}/ask")
 def api_ask_pull_copilot(ticker: str, req: AskCopilotRequest) -> dict[str, Any]:
+    ticker = _ticker_or_400(ticker)
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
     try:
@@ -314,7 +340,7 @@ def api_ask_pull_copilot(ticker: str, req: AskCopilotRequest) -> dict[str, Any]:
     except HTTPException:
         raise
     except Exception as exc:
-        raise _friendly_upstream_error(f"Copilot Q&A ({ticker.upper()})", exc)
+        raise _friendly_upstream_error(f"Copilot Q&A ({ticker})", exc)
 
 
 @app.get("/api/cost")

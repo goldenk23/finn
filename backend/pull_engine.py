@@ -5,7 +5,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from backend.db import get_conn, DB_PATH
+from backend.db import get_conn, normalize_ticker, DB_PATH
 from backend.pdf_utils import extract_pdf_text
 from backend.scrapers.screener import fetch_screener_fundamentals
 from backend.scrapers.filings import fetch_company_filings
@@ -172,9 +172,7 @@ def get_or_generate_pull_report(
     4. Reduce step (gemini-2.5-pro / fallback): Synthesizes the 8 research modules including the
        4-quarter 'Numbers vs. Narrative' comparison grounded strictly in primary data.
     """
-    clean_ticker = ticker.upper().replace(".NS", "").replace(".BO", "").strip()
-    if not clean_ticker:
-        raise ValueError("Ticker cannot be empty")
+    clean_ticker = normalize_ticker(ticker)
 
     lock = _get_ticker_lock(clean_ticker)
     with lock:
@@ -755,7 +753,7 @@ def ask_pull_copilot(
     On-demand Q&A grounded strictly in the company's primary fundamentals and Pull report.
     Uses Tier-2 (gemini-2.5-flash) for fast, low-cost interactive responses.
     """
-    clean_ticker = ticker.upper().replace(".NS", "").replace(".BO", "").strip()
+    clean_ticker = normalize_ticker(ticker)
     pull_data = get_or_generate_pull_report(clean_ticker, force_refresh=False, db_path=db_path)
     fundamentals = pull_data["fundamentals"]
     report = pull_data["report"]

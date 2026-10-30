@@ -1,6 +1,8 @@
+import re
 from typing import Any
 import httpx
 from bs4 import BeautifulSoup, Tag
+from backend.db import normalize_ticker
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -48,7 +50,7 @@ def fetch_screener_fundamentals(ticker: str) -> dict[str, Any]:
     -Extracts Top Ratios, Quarterly Results, Annual P&L, Balance Sheet, Cash Flow, Ratios,
      plus links to Annual Reports and Concall Transcripts / Notes.
     """
-    clean_ticker = ticker.upper().replace(".NS", "").replace(".BO", "").strip()
+    clean_ticker = normalize_ticker(ticker)
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -87,6 +89,10 @@ def fetch_screener_fundamentals(ticker: str) -> dict[str, Any]:
         company_name = h1.get_text(strip=True) if h1 else clean_ticker
         about_div = soup.find("div", class_="company-profile") or soup.find("div", class_="about")
         about_text = about_div.get_text(" ", strip=True) if about_div else ""
+        # BSE scrip code from the company's bseindia.com quote link, e.g. .../stock-share-price/eternal-ltd/ETERNAL/543320/
+        bse_link = soup.find("a", href=re.compile(r"bseindia\.com/stock-share-price/"))
+        bse_match = re.search(r"/(\d{6})/", bse_link["href"]) if bse_link else None
+        bse_code = bse_match.group(1) if bse_match else ""
 
         # 2. Key Top Ratios (Market Cap, Current Price, Stock P/E, ROCE, ROE, etc.)
         top_ratios: dict[str, str] = {}
@@ -155,6 +161,7 @@ def fetch_screener_fundamentals(ticker: str) -> dict[str, Any]:
         return {
             "ticker": clean_ticker,
             "company_name": company_name,
+            "bse_code": bse_code,
             "screener_url": used_url,
             "about": about_text,
             "top_ratios": top_ratios,

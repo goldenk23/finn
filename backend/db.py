@@ -1,22 +1,44 @@
 import sqlite3
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 DB_PATH = Path(__file__).parent / "finn.db"
+
+# Exchange symbol renames (old -> current). NSE, BSE, Screener and yfinance only answer to the new symbols.
+TICKER_RENAMES = {"ZOMATO": "ETERNAL", "TATAMOTORS": "TMPV"}
+_TICKER_RE = re.compile(r"[A-Z0-9&-]{1,20}")
+
+
+def normalize_ticker(raw: str) -> str:
+    """Uppercase, drop a .NS/.BO suffix, apply renames, and reject anything that isn't a plain NSE symbol.
+
+    The result is interpolated into NSE/Screener URLs, so the strict whitelist is the trust boundary.
+    """
+    t = (raw or "").strip().upper()
+    if t.endswith((".NS", ".BO")):
+        t = t[:-3]
+    t = TICKER_RENAMES.get(t, t)
+    if not _TICKER_RE.fullmatch(t):
+        raise ValueError(
+            f"Invalid ticker {raw!r}: use an NSE symbol of 1-20 letters, digits, '&' or '-' (e.g. TCS, M&M, BAJAJ-AUTO)"
+        )
+    return t
+
 
 SEED_PORTFOLIO = [
     ("RELIANCE", "500325", "Reliance Industries Ltd", "Energy & Retail", "Large Cap"),
     ("TCS", "532540", "Tata Consultancy Services Ltd", "IT Services", "Large Cap"),
     ("HDFCBANK", "500180", "HDFC Bank Ltd", "Banking", "Large Cap"),
     ("INFY", "500209", "Infosys Ltd", "IT Services", "Large Cap"),
-    ("TATAMOTORS", "500570", "Tata Motors Ltd", "Automobiles", "Large Cap"),
+    ("TMPV", "500570", "Tata Motors Passenger Vehicles Ltd", "Automobiles", "Large Cap"),
     ("SUNPHARMA", "524715", "Sun Pharmaceutical Industries Ltd", "Pharma", "Large Cap"),
     ("TRENT", "500251", "Trent Ltd", "Retail", "Large Cap"),
     ("LT", "500510", "Larsen & Toubro Ltd", "Infrastructure", "Large Cap"),
     ("BAJFINANCE", "500034", "Bajaj Finance Ltd", "NBFC", "Large Cap"),
     ("MARUTI", "532500", "Maruti Suzuki India Ltd", "Automobiles", "Large Cap"),
-    ("ZOMATO", "543320", "Zomato Ltd (Eternal)", "Consumer Tech", "Large Cap"),
+    ("ETERNAL", "543320", "Eternal Ltd", "Consumer Tech", "Large Cap"),
     ("HAL", "541154", "Hindustan Aeronautics Ltd", "Defence", "Large Cap"),
     ("ITC", "500875", "ITC Ltd", "FMCG", "Large Cap"),
     ("TITAN", "500114", "Titan Company Ltd", "Consumer Discretionary", "Large Cap"),
@@ -108,14 +130,35 @@ def init_db(db_path: Path = DB_PATH) -> None:
             );
             """
         )
-        conn.executemany(
-            """
-            INSERT OR IGNORE INTO portfolio (ticker, bse_code, company_name, sector, cap_tier)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            SEED_PORTFOLIO,
-        )
+        _migrate_renamed_tickers(conn)
+        # Seed only a brand-new DB, so stocks the user deleted stay deleted across restarts.
+        if conn.execute("SELECT COUNT(*) FROM portfolio").fetchone()[0] == 0:
+            conn.executemany(
+                """
+                INSERT INTO portfolio (ticker, bse_code, company_name, sector, cap_tier)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                SEED_PORTFOLIO,
+            )
         conn.execute("INSERT OR IGNORE INTO alert_rules (id) VALUES (1);")
+
+
+def _migrate_renamed_tickers(conn: sqlite3.Connection) -> None:
+    """Move rows from old symbols to new ones. Idempotent: a no-op once no old-symbol rows remain.
+
+    UPDATE OR IGNORE skips rows whose new key already exists (e.g. an ETERNAL price for the same day);
+    those old-symbol duplicates are stale, so they are deleted.
+    """
+    seed_names = {row[0]: row[2] for row in SEED_PORTFOLIO}
+    for old, new in TICKER_RENAMES.items():
+        conn.execute(
+            "UPDATE OR IGNORE portfolio SET ticker = ?, company_name = ? WHERE ticker = ?",
+            (new, seed_names.get(new, new), old),
+        )
+        for table in ("eod_prices", "announcements", "pull_reports_cache"):
+            conn.execute(f"UPDATE OR IGNORE {table} SET ticker = ? WHERE ticker = ?", (new, old))
+        for table in ("portfolio", "eod_prices", "announcements", "pull_reports_cache"):
+            conn.execute(f"DELETE FROM {table} WHERE ticker = ?", (old,))
 
 
 def get_portfolio(db_path: Path = DB_PATH) -> list[dict[str, Any]]:

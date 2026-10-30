@@ -3,8 +3,9 @@ import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 import httpx
-from backend.db import get_conn, DB_PATH
+from backend.db import get_conn, normalize_ticker, DB_PATH
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -120,18 +121,19 @@ def fetch_nse_announcements(ticker: str, days: int = 10) -> list[dict[str, Any]]
     Fetch corporate announcements for an NSE ticker using NSE's official JSON API
     with session cookie warm-up.
     """
-    clean_ticker = ticker.upper().replace(".NS", "").replace(".BO", "").strip()
+    clean_ticker = normalize_ticker(ticker)
+    symbol_q = quote(clean_ticker, safe="")  # "M&M" -> "M%26M" so '&' can't split the query string
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Referer": f"https://www.nseindia.com/get-quotes/equity?symbol={clean_ticker}",
+        "Referer": f"https://www.nseindia.com/get-quotes/equity?symbol={symbol_q}",
     }
     to_date = datetime.now().strftime("%d-%m-%Y")
     from_date = (datetime.now() - timedelta(days=days)).strftime("%d-%m-%Y")
     url = (
         f"https://www.nseindia.com/api/corporate-announcements"
-        f"?index=equities&symbol={clean_ticker}&from_date={from_date}&to_date={to_date}"
+        f"?index=equities&symbol={symbol_q}&from_date={from_date}&to_date={to_date}"
     )
 
     items: list[dict[str, Any]] = []
@@ -189,7 +191,7 @@ def fetch_bse_announcements(ticker: str, bse_code: str, days: int = 10) -> list[
     """
     if not bse_code:
         return []
-    clean_ticker = ticker.upper().replace(".NS", "").replace(".BO", "").strip()
+    clean_ticker = normalize_ticker(ticker)
     to_dt = datetime.now().strftime("%Y%m%d")
     from_dt = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
     url = (

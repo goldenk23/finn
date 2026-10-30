@@ -45,19 +45,19 @@ interface PullTabProps {
 
 const ADHOC_DEMO_TICKERS = ["DIXON", "POLYCAB", "INDHOTEL", "PERSISTENT"];
 
-// ponytail: lightweight client-side NSE symbol + company name/alias directory resolves common investor searches (e.g. "Reliance", "Eternal" -> ZOMATO, "Taj" -> INDHOTEL) without an extra backend autocomplete roundtrip.
+// ponytail: lightweight client-side NSE symbol + company name/alias directory resolves common investor searches (e.g. "Reliance", "Zomato" -> ETERNAL, "Taj" -> INDHOTEL) without an extra backend autocomplete roundtrip.
 const NSE_DIRECTORY: { ticker: string; name: string; aliases?: string[] }[] = [
   { ticker: "RELIANCE", name: "Reliance Industries Ltd", aliases: ["ril", "jio"] },
   { ticker: "TCS", name: "Tata Consultancy Services Ltd", aliases: ["tata consultancy"] },
   { ticker: "HDFCBANK", name: "HDFC Bank Ltd", aliases: ["hdfc"] },
   { ticker: "INFY", name: "Infosys Ltd", aliases: ["infosys"] },
-  { ticker: "TATAMOTORS", name: "Tata Motors Ltd", aliases: ["tamO", "jlr"] },
+  { ticker: "TMPV", name: "Tata Motors Passenger Vehicles Ltd", aliases: ["tata motors", "tatamotors", "jlr"] },
   { ticker: "SUNPHARMA", name: "Sun Pharmaceutical Industries", aliases: ["sun pharma"] },
   { ticker: "TRENT", name: "Trent Ltd (Zudio / Westside)", aliases: ["zudio", "westside"] },
   { ticker: "LT", name: "Larsen & Toubro Ltd", aliases: ["l&t", "larsen"] },
   { ticker: "BAJFINANCE", name: "Bajaj Finance Ltd", aliases: ["bajaj", "bafin"] },
   { ticker: "MARUTI", name: "Maruti Suzuki India Ltd", aliases: ["suzuki"] },
-  { ticker: "ZOMATO", name: "Eternal Ltd (Zomato / Blinkit)", aliases: ["eternal", "blinkit"] },
+  { ticker: "ETERNAL", name: "Eternal Ltd (Zomato / Blinkit)", aliases: ["zomato", "eternal", "blinkit"] },
   { ticker: "HAL", name: "Hindustan Aeronautics Ltd", aliases: ["hindustan aeronautics"] },
   { ticker: "ITC", name: "ITC Ltd", aliases: ["itc"] },
   { ticker: "TITAN", name: "Titan Company Ltd", aliases: ["tanishq"] },

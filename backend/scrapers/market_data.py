@@ -1,14 +1,7 @@
 from typing import Any
 from pathlib import Path
 import yfinance as yf
-from backend.db import get_conn, get_alert_rules, DB_PATH
-
-
-# ponytail: map renamed/demerged NSE symbols on Yahoo Finance (ZOMATO -> ETERNAL.NS, TATAMOTORS -> TMPV.NS) so all 16 portfolio stocks price cleanly.
-YFINANCE_SYMBOL_ALIASES: dict[str, list[str]] = {
-    "ZOMATO": ["ETERNAL.NS", "543320.BO"],
-    "TATAMOTORS": ["TMPV.NS", "500570.BO"],
-}
+from backend.db import get_conn, get_alert_rules, normalize_ticker, DB_PATH
 
 
 def fetch_eod_metrics(
@@ -25,10 +18,8 @@ def fetch_eod_metrics(
 
     results: list[dict[str, Any]] = []
     for raw_ticker in tickers:
-        clean_ticker = raw_ticker.upper().replace(".NS", "").replace(".BO", "").strip()
-        candidate_symbols = YFINANCE_SYMBOL_ALIASES.get(
-            clean_ticker, [f"{clean_ticker}.NS", f"{clean_ticker}.BO"]
-        )
+        clean_ticker = normalize_ticker(raw_ticker)
+        candidate_symbols = [f"{clean_ticker}.NS", f"{clean_ticker}.BO"]
         try:
             hist = None
             for sym in candidate_symbols:
