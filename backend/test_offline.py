@@ -747,6 +747,15 @@ def test_results_enrichment_end_to_end() -> None:
             out = llm_router.enrich_quarterly_results("SUNPHARMA", title, "https://x/r.pdf", db_path=db)
             assert out["verification_status"] == "screener_fallback" and out["metrics"]["ebitda"]["value"] == "4,744", out
             assert out["basis_note"] == "Consolidated • EBITDA ex-other income" and out["model"] is None
+
+            # Live SUNPHARMA miss: PDF revenue read off a sub-line fails the cross-check, Screener numbers are used,
+            # and the filing's exceptional charge still reaches the takeaway (the hype takeaway is rejected)
+            cur = {**SUN_RAW["columns"]["current"], "revenue_from_operations": 161000.1}
+            pdf_reply.clear()
+            pdf_reply.update(SUN_RAW, columns={**SUN_RAW["columns"], "current": cur})
+            out = llm_router.enrich_quarterly_results("SUNPHARMA", title, "https://x/r.pdf", db_path=db)
+            assert out["verification_status"] == "screener_fallback" and out["metrics"]["revenue"]["value"] == "16,199", out
+            assert "exceptional charge of ₹1,269 Cr" in out["takeaway"] and out["model"] is None, out
     finally:
         for k, v in orig.items():
             setattr(llm_router, k, v)

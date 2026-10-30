@@ -391,7 +391,7 @@ def _normalize_results_enrichment(res: dict[str, Any]) -> dict[str, Any]:
 #   revenue - total expenses + D&A. RBI-format bank tables report D&A inside operating expenses, and Screener
 #   shows bank depreciation as 0, so nothing is added back there.
 # - PAT = net profit for the period before the non-controlling-interest split (Screener's "Net Profit").
-UNIT_TO_CR = {"crore": 1.0, "lakh": 0.01, "million": 0.1, "billion": 100.0, "thousand": 0.0001}
+UNIT_TO_CR = {"cr": 1.0, "lakh": 0.01, "million": 0.1, "billion": 100.0, "thousand": 0.0001}
 _BANK_KEYS = ("interest_earned", "other_income", "interest_expended", "operating_expenses", "provisions")
 _STANDARD_KEYS = ("revenue_from_operations", "other_income", "total_expenses")
 
@@ -749,8 +749,9 @@ Filing title: {filing_title}
 1. Use the Statement of Profit and Loss. Prefer the CONSOLIDATED statement when the filing has both; use Standalone only if there is no consolidated statement.
 2. Use only the three quarter columns: "current" (latest quarter ended), "previous" (the quarter before it) and "year_ago" (same quarter last year). Ignore half-year, nine-month and full-year columns.
 3. Copy each number exactly as printed, in the table's own unit. Numbers in brackets are negative. Use 0 for a line printed as "-" or blank, and null only when the line does not exist.
-4. Standard / NBFC format (Revenue from operations ... Total expenses) items:
-   revenue_from_operations ("Total revenue from operations", excluding other income), other_income,
+4. Pick the format from the statement's first income line. If it is "Revenue from operations", use the standard keys, even for NBFCs whose revenue lists "Interest income" (e.g. Bajaj Finance). Use the bank keys only when it is "Interest earned".
+   Standard / NBFC format (Revenue from operations ... Total expenses) items:
+   revenue_from_operations (the "Total revenue from operations" line including other operating revenues, not a sub-line such as "Revenue from contracts with customers" or "Interest income"; excluding other income), other_income,
    total_expenses (the "Total expenses" line), finance_costs, depreciation_amortisation,
    exceptional_items (signed effect on profit: negative for a charge/loss), pbt (profit before tax, after exceptional items),
    pat (net profit for the period after tax and share of associates/JVs, BEFORE the non-controlling-interest split, not "attributable to owners").
@@ -804,6 +805,9 @@ Filing PDF Text:
     res = {k: sc_ref[k] for k in ("has_numbers", "quarter_end", "period", "unit", "basis", "is_financial",
                                   "operating_label", "basis_note", "source", "metrics")}
     res["verification_status"] = "screener_fallback"
+    # ponytail: Screener has no exceptional-items row, so the filing's own (same quarter + basis) line is used even
+    # when its other numbers failed the cross-check. A misread exceptional line would show up in the takeaway only.
+    res["exceptional_items_cr"] = (pdf_res or {}).get("exceptional_items_cr") or 0.0
     out = _finish_results(ticker, res, sc_ref["series"], db_path)
     out["model"] = out.get("takeaway_model")  # None = numbers and takeaway are deterministic, no LLM involved
     return out
