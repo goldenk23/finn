@@ -26,9 +26,11 @@ def main() -> None:
     init_db()
     test_ticker = "TRENT"
 
-    print(f"=== 1. Generating Deep Pull Research Report for {test_ticker} (Primary Sources Only) ===")
+    # Regenerating costs paid Gemini calls, so only do it when explicitly asked: python backend/test_pull.py --force
+    force = "--force" in sys.argv
+    print(f"=== 1. Generating Deep Pull Research Report for {test_ticker} (Primary Sources Only, force={force}) ===")
     t0 = time.perf_counter()
-    res = get_or_generate_pull_report(test_ticker, force_refresh=True)
+    res = get_or_generate_pull_report(test_ticker, force_refresh=force)
     elapsed_cold = time.perf_counter() - t0
 
     report = res["report"]
