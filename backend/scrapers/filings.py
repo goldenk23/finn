@@ -81,6 +81,7 @@ _BOARD_MEETING_NOTICE = _wb(
     r"|notice of (?:the )?board meeting|board of directors (?:to|will|shall) meet|board meeting (?:is )?(?:scheduled|to be held)"
 )
 _OUTCOME = _wb_any(["outcome of board meeting"])
+_IPO_SUBSIDIARY = _wb(r"jio platforms|initial public offer\w*")
 # ENAM puts auditor appointments in `unclassified` (routine paperwork); scrutinizers are AGM/postal ballot admin
 _AUDITOR_APPOINTMENT = _wb(
     r"(?:re-?)?appoint\w*.*(?:(?:statutory|secretarial|cost|internal)\s+auditors?|scrutini[sz]ers?)"
@@ -149,7 +150,7 @@ def enforce_filing_hygiene(title: str, category: str, materiality: int, is_lende
 
     # 3. Prior board meeting date intimations (for results, fund raising or anything else) are routine
     if not _OUTCOME.search(t):
-        if category == "results" and ("jio platforms" in t or "initial public offer" in t):
+        if category == "results" and _IPO_SUBSIDIARY.search(t):
             return "fund_raise", 1
         if _BOARD_MEETING_NOTICE.search(t) or (category == "results" and _RESULTS_DATE_NOTICE.search(t)):
             return "unclassified", 0

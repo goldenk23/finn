@@ -816,6 +816,8 @@ def test_classifier_rules() -> None:
     # An auditor appointment inside a results outcome keeps the results material
     both = "Outcome of Board Meeting: financial results for Q2 and appointment of secretarial auditors"
     assert enforce_filing_hygiene(both, "results", 1) == ("results", 1)
+    # Subsidiary IPO filings misread as results are fund raises; matched as whole words ("offering" via offer\w*)
+    assert enforce_filing_hygiene("Results of Jio Platforms initial public offering", "results", 1) == ("fund_raise", 1)
 
 
 def test_batch_triage_reads_pdf_for_vague_titles() -> None:
