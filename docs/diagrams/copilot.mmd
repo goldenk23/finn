@@ -1,0 +1,7 @@
+flowchart TB
+    A["Ask a question in<br/>Ask [company] Primary-Source Copilot"] --> B["Load that company's report and tables<br/>Generate report first if missing"]
+    B --> C["Build context from tables, report synthesis,<br/>and available source references"]
+    C --> D["Flash generates answer and citation tags<br/>(labels identifying supporting material)"]
+    D --> E["Resolve tags against known company sources"]
+    E --> F["Render formatted answer and source badges"]
+    F --> G["External source: open webpage or PDF<br/>Synthesized Report: jump to internal section<br/>Unresolved source: show unavailable"]

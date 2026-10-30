@@ -1,0 +1,39 @@
+flowchart TB
+    USER["You: follow a company or ask a question"]
+    subgraph BROWSER["1. Browser: Next.js + React, port 3000"]
+        UI["Push Digest (filtered announcement feed)<br/>Alerts (items matching your rules)<br/>Pull Deep (research on request)<br/>Portfolio (company watchlist)"]
+    end
+    PROXY["2. Next.js forwards /api requests<br/>to FastAPI, port 8000"]
+    subgraph SERVER["3. Python backend: chooses the workflow"]
+        API["FastAPI<br/>Receives requests and returns JSON (structured display data)"]
+        PUSH["push_engine.py<br/>Filters announcements; evaluates alert rules"]
+        PULL["pull_engine.py<br/>Builds research; answers follow-up questions"]
+        WATCH["Portfolio operations<br/>Add or remove tracked companies"]
+        COLLECT["Scrapers + pdf_utils.py<br/>Fetch tables and documents; extract relevant PDF pages"]
+        AI["llm_router.py<br/>Chooses Gemini model; records usage and estimated cost"]
+    end
+    subgraph EXTERNAL["4. External information and AI services"]
+        SOURCES["NSE / BSE (Indian stock exchanges): announcements<br/>Screener.in: financial tables and document links<br/>Yahoo Finance: prices and volume (shares traded)<br/>DuckDuckGo: executive background search"]
+        GEMINI["Google Gemini<br/>Vertex AI credentials or Gemini API key"]
+    end
+    subgraph STORAGE["5. Local storage: reused across requests"]
+        DB[("backend/finn.db<br/>Watchlist, prices, announcements, alert rules,<br/>saved reports, AI usage and estimated costs")]
+        PDF[("backend/cache_pdfs/<br/>Downloaded PDFs")]
+    end
+    USER --> UI --> PROXY --> API
+    API --> PUSH
+    API --> PULL
+    API --> WATCH
+    PUSH --> COLLECT
+    PULL --> COLLECT
+    WATCH --> COLLECT
+    COLLECT --> SOURCES
+    COLLECT <--> PDF
+    PUSH --> AI
+    PULL --> AI
+    AI --> GEMINI
+    PUSH <--> DB
+    PULL <--> DB
+    WATCH <--> DB
+    AI --> DB
+    API --> RESULT["6. Results return to the requesting screen"]

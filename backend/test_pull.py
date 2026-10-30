@@ -6,8 +6,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from backend.db import init_db
-from backend.pull_engine import get_or_generate_pull_report, ask_pull_copilot
+from backend.pull_engine import get_or_generate_pull_report, ask_pull_copilot, resolve_copilot_citations
 from backend.llm_router import get_cost_summary
+from backend.main import _sanitize_log_message
 
 REQUIRED_MODULES = [
     "business_snapshot",
@@ -66,6 +67,20 @@ def main() -> None:
     qa = ask_pull_copilot(test_ticker, "How has Trent's operating margin (OPM) and cash conversion evolved over the last 3 years?")
     print("Answer:\n", qa["answer"])
     print("Citations:", qa["citations"])
+    print("Citation Links:", json.dumps(qa.get("citation_links", []), indent=2))
+    assert "citation_links" in qa and len(qa["citation_links"]) == len(qa["citations"]), "Missing citation_links"
+
+    # Unit check for citation resolution & log redaction
+    sample_links = resolve_copilot_citations(
+        ["Screener Q4 FY26 Table", "Synthesized Report", "Nonexistent Document XYZ"],
+        res["fundamentals"],
+        report,
+    )
+    assert sample_links[0]["kind"] == "webpage" and sample_links[0]["available"] is True
+    assert sample_links[1]["kind"] == "internal_report" and sample_links[1]["available"] is True
+    assert sample_links[2]["kind"] == "unavailable" and sample_links[2]["available"] is False
+    redacted = _sanitize_log_message("key=AQ.Ab8RN6Kxyz1234567890 token=ya29.a0AfH6SMxyz1234567890")
+    assert "AQ.Ab8" not in redacted and "ya29." not in redacted, f"Redaction failed: {redacted}"
 
     print("\n=== 4. Updated LLM Cost Ledger ===")
     print(json.dumps(get_cost_summary(), indent=2))

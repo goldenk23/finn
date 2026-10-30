@@ -1,0 +1,7 @@
+flowchart TB
+    A["Change Configurable Alert Thresholds<br/>or Watched Material Filing Categories"] --> B["Save rules in SQLite"]
+    B --> C["Evaluate latest stored price and volume (shares traded)<br/>and announcements in the requested window"]
+    C --> D{"Which rule matches?"}
+    D -->|"Price or volume threshold"| E["EOD Price & Volume Anomalies<br/>(unusual price changes or trading activity)"]
+    D -->|"Watched category"| F["Triggered Filing Alerts<br/>(announcements matching your interests)"]
+    D -->|"No match"| G["Show empty-state explanation"]

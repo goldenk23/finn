@@ -182,10 +182,19 @@ export interface PullReport {
   sources_used?: {
     screener_url?: string;
     documents_parsed?: { period: string; doc_type: string; url: string }[];
-    concalls_available?: { period: string; transcript_url?: string; ppt_url?: string }[];
+    concalls_available?: { period: string; transcript_url?: string; ppt_url?: string; audio_url?: string }[];
     annual_reports_available?: { title: string; url: string }[];
     material_filings_count?: number;
+    material_filings?: { date: string; category: string; title: string; pdf_url: string }[];
   };
+}
+
+export interface CopilotCitationLink {
+  label: string;
+  kind: "webpage" | "document" | "internal_report" | "unavailable";
+  url?: string | null;
+  section_id?: string | null;
+  available: boolean;
 }
 
 export interface PullResponse {
@@ -202,6 +211,8 @@ export interface PullResponse {
     screener_url?: string;
     about?: string;
     top_ratios?: Record<string, string>;
+    concalls?: { period: string; transcript_url?: string; ppt_url?: string; audio_url?: string }[];
+    annual_reports?: { title: string; url: string }[];
   };
   report: PullReport;
 }
@@ -222,6 +233,7 @@ export interface CopilotQAResponse {
   question: string;
   answer: string;
   citations: string[];
+  citation_links?: CopilotCitationLink[];
 }
 
 export interface CostWorkflowRow {

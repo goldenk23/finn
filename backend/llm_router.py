@@ -23,15 +23,19 @@ MODEL_PRO = "gemini-2.5-pro"
 MODEL_PRICING_PER_1M: dict[str, tuple[float, float]] = {
     MODEL_FLASH_LITE: (0.10, 0.40),
     MODEL_FLASH: (0.30, 2.50),
+    "gemini-3-flash-preview": (0.30, 2.50),
     MODEL_PRO: (1.25, 10.00),
     "gemini-3.1-pro-preview": (1.25, 10.00),
 }
 
 MODEL_FALLBACKS: dict[str, list[str]] = {
-    MODEL_FLASH_LITE: [MODEL_FLASH_LITE, MODEL_FLASH],
-    MODEL_FLASH: [MODEL_FLASH, MODEL_FLASH],
-    MODEL_PRO: [MODEL_PRO, "gemini-3.1-pro-preview", MODEL_FLASH],
+    MODEL_FLASH_LITE: [MODEL_FLASH_LITE, MODEL_FLASH, "gemini-3-flash-preview"],
+    MODEL_FLASH: [MODEL_FLASH, "gemini-3-flash-preview"],
+    MODEL_PRO: [MODEL_PRO, MODEL_FLASH, "gemini-3-flash-preview", "gemini-3.1-pro-preview"],
 }
+
+# Cache models that return 404 NOT_FOUND in the active GCP project to avoid repeated 404 roundtrips
+_UNAVAILABLE_MODELS: set[str] = set()
 
 VALID_CATEGORIES = [
     "results",
@@ -63,6 +67,16 @@ def _get_client() -> genai.Client:
     # Standard Gemini Developer API key (AIza...)
     if api_key.startswith("AIza") and not use_vertex:
         return genai.Client(vertexai=False, api_key=api_key)
+
+    # Auto-discover ADC GCP project if GOOGLE_CLOUD_PROJECT is not in os.environ / .env
+    if not project:
+        try:
+            import google.auth
+            _, adc_project = google.auth.default()
+            if adc_project:
+                project = str(adc_project).strip()
+        except Exception:
+            pass
 
     # Vertex AI with GCP project (uses Application Default Credentials + GCP credits)
     if project:
@@ -132,17 +146,20 @@ def _call_gemini_json(
     db_path: Path = DB_PATH,
 ) -> Any:
     client = _get_client()
-    candidates = MODEL_FALLBACKS.get(model, [model])
+    raw_candidates = MODEL_FALLBACKS.get(model, [model])
+    candidates = [m for m in raw_candidates if m not in _UNAVAILABLE_MODELS] or raw_candidates
     last_err: Exception | None = None
 
     for candidate_model in candidates:
         try:
+            tb = 512 if "pro" in candidate_model else 0
             resp = client.models.generate_content(
                 model=candidate_model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     temperature=temperature,
                     response_mime_type="application/json",
+                    thinking_config=types.ThinkingConfig(thinking_budget=tb),
                 ),
             )
             usage = resp.usage_metadata
@@ -160,10 +177,14 @@ def _call_gemini_json(
             return json.loads(raw_text)
         except Exception as exc:
             last_err = exc
-            if "404" in str(exc) or "NOT_FOUND" in str(exc) or isinstance(exc, json.JSONDecodeError):
+            err_str = str(exc)
+            if "404" in err_str or "NOT_FOUND" in err_str:
+                _UNAVAILABLE_MODELS.add(candidate_model)
+                continue
+            if isinstance(exc, json.JSONDecodeError):
                 continue
             raise
-    raise RuntimeError(f"All candidate models {candidates} failed: {last_err}")
+    raise RuntimeError(f"All candidate models {raw_candidates} failed: {last_err}")
 
 
 def classify_and_summarize_batch(

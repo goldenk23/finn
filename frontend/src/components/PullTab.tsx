@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import {
   Search,
   Sparkles,
@@ -24,6 +24,7 @@ import {
 import {
   CachedReportMeta,
   CashVsPatPoint,
+  CopilotCitationLink,
   CopilotQAResponse,
   PortfolioItem,
   PullResponse,
@@ -245,6 +246,546 @@ function CashVsPatChart({ series }: { series: CashVsPatPoint[] }) {
   );
 }
 
+// ponytail: zero-dependency React Markdown renderer converts **bold**, *italic*, `code`, [links](https://...), lists, and headings into safe React elements without dangerouslySetInnerHTML (XSS-proof); ceiling: no LaTeX or nested HTML blocks; upgrade path: react-markdown + remark-gfm if full CommonMark AST is needed.
+function renderInlineMarkdown(text?: string | null): React.ReactNode {
+  if (!text) return null;
+  const tokenRegex =
+    /(\[[^\]]+\]\(https?:\/\/[^\s)]+\)|`[^`]+`|\*\*\*[^*]+\*\*\*|\*\*[^*]+\*\*|__[^_]+__|(?<![a-zA-Z0-9*])\*[^*\n]+\*(?![*])|(?<![a-zA-Z0-9_])_[^_\n]+_(?![a-zA-Z0-9_]))/g;
+  const parts = text.split(tokenRegex);
+  return parts.map((part, idx) => {
+    if (!part) return null;
+    if (part.startsWith("[") && part.includes("](") && part.endsWith(")")) {
+      const m = part.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/i);
+      if (m) {
+        return (
+          <a
+            key={idx}
+            href={m[2]}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-cyan-400 underline hover:text-cyan-300"
+          >
+            {renderInlineMarkdown(m[1])}
+          </a>
+        );
+      }
+    }
+    if (part.startsWith("`") && part.endsWith("`") && part.length > 2) {
+      return (
+        <code
+          key={idx}
+          className="rounded bg-zinc-800/90 px-1 py-0.5 font-mono text-[11px] text-cyan-300"
+        >
+          {part.slice(1, -1)}
+        </code>
+      );
+    }
+    if (part.startsWith("***") && part.endsWith("***") && part.length > 6) {
+      return (
+        <strong key={idx} className="font-semibold italic text-white">
+          {part.slice(3, -3)}
+        </strong>
+      );
+    }
+    if (
+      ((part.startsWith("**") && part.endsWith("**")) ||
+        (part.startsWith("__") && part.endsWith("__"))) &&
+      part.length > 4
+    ) {
+      return (
+        <strong key={idx} className="font-semibold text-white">
+          {renderInlineMarkdown(part.slice(2, -2))}
+        </strong>
+      );
+    }
+    if (
+      ((part.startsWith("*") && part.endsWith("*")) ||
+        (part.startsWith("_") && part.endsWith("_"))) &&
+      part.length > 2
+    ) {
+      return (
+        <em key={idx} className="italic text-zinc-200">
+          {renderInlineMarkdown(part.slice(1, -1))}
+        </em>
+      );
+    }
+    return <React.Fragment key={idx}>{part}</React.Fragment>;
+  });
+}
+
+function FormattedMarkdown({ content }: { content: string }) {
+  if (!content) return null;
+  const lines = content.replace(/\r\n/g, "\n").split("\n");
+  const blocks: React.ReactNode[] = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const rawLine = lines[i];
+    const trimmed = rawLine.trim();
+
+    if (!trimmed) {
+      i++;
+      continue;
+    }
+
+    // Heading (#, ##, ###, ####)
+    const headingMatch = trimmed.match(/^(#{1,4})\s+(.+)$/);
+    if (headingMatch) {
+      blocks.push(
+        <div
+          key={`h-${i}`}
+          className="font-bold text-white text-xs mt-1.5 mb-0.5"
+        >
+          {renderInlineMarkdown(headingMatch[2])}
+        </div>
+      );
+      i++;
+      continue;
+    }
+
+    // Unordered list (-, *, •)
+    if (/^([-*•])\s+/.test(trimmed)) {
+      const items: string[] = [];
+      while (i < lines.length && /^([-*•])\s+/.test(lines[i].trim())) {
+        items.push(lines[i].trim().replace(/^([-*•])\s+/, ""));
+        i++;
+      }
+      blocks.push(
+        <ul
+          key={`ul-${i}`}
+          className="space-y-1 pl-3.5 list-disc marker:text-cyan-400"
+        >
+          {items.map((it, idx) => (
+            <li key={idx} className="leading-relaxed text-zinc-100">
+              {renderInlineMarkdown(it)}
+            </li>
+          ))}
+        </ul>
+      );
+      continue;
+    }
+
+    // Ordered list (1. or 1))
+    if (/^\d+[.)]\s+/.test(trimmed)) {
+      const items: string[] = [];
+      while (i < lines.length && /^\d+[.)]\s+/.test(lines[i].trim())) {
+        items.push(lines[i].trim().replace(/^\d+[.)]\s+/, ""));
+        i++;
+      }
+      blocks.push(
+        <ol
+          key={`ol-${i}`}
+          className="space-y-1 pl-4 list-decimal marker:text-cyan-400"
+        >
+          {items.map((it, idx) => (
+            <li key={idx} className="leading-relaxed text-zinc-100">
+              {renderInlineMarkdown(it)}
+            </li>
+          ))}
+        </ol>
+      );
+      continue;
+    }
+
+    // Paragraph (combine consecutive non-empty non-list lines)
+    const paraLines: string[] = [];
+    while (
+      i < lines.length &&
+      lines[i].trim() !== "" &&
+      !/^([-*•]|\d+[.)]|#{1,4})\s+/.test(lines[i].trim())
+    ) {
+      paraLines.push(lines[i].trim());
+      i++;
+    }
+    blocks.push(
+      <p key={`p-${i}`} className="leading-relaxed text-zinc-100">
+        {renderInlineMarkdown(paraLines.join(" "))}
+      </p>
+    );
+  }
+
+  return <div className="space-y-1.5 text-xs">{blocks}</div>;
+}
+
+const MONTH_TOKENS = [
+  "jan",
+  "feb",
+  "mar",
+  "apr",
+  "may",
+  "jun",
+  "jul",
+  "aug",
+  "sep",
+  "oct",
+  "nov",
+  "dec",
+];
+
+function quarterToConcallMonths(low: string): { months: string[]; year: string | null } {
+  const m = low.match(/\bq([1-4])\s*(?:fy)?\s*'?(\d{2,4})\b/);
+  if (!m) return { months: [], year: null };
+  const qNum = parseInt(m[1], 10);
+  const rawYr = m[2];
+  const fyYear = rawYr.length === 2 ? 2000 + parseInt(rawYr, 10) : parseInt(rawYr, 10);
+  if (qNum === 1) return { months: ["jul", "aug", "jun"], year: String(fyYear - 1) };
+  if (qNum === 2) return { months: ["oct", "nov", "sep"], year: String(fyYear - 1) };
+  if (qNum === 3) return { months: ["jan", "feb", "dec"], year: String(fyYear) };
+  return { months: ["apr", "may", "mar"], year: String(fyYear) };
+}
+
+function resolveCitationLink(
+  rawCit: string | CopilotCitationLink,
+  pullData: PullResponse | null
+): CopilotCitationLink {
+  if (typeof rawCit === "object" && rawCit !== null && rawCit.label) {
+    if (
+      (rawCit.kind === "webpage" || rawCit.kind === "document") &&
+      rawCit.url &&
+      /^https?:\/\//i.test(rawCit.url)
+    ) {
+      return rawCit;
+    }
+    if (rawCit.kind === "internal_report" && rawCit.section_id) {
+      return rawCit;
+    }
+    if (!rawCit.available || rawCit.kind === "unavailable") {
+      return { ...rawCit, available: false, kind: "unavailable" };
+    }
+  }
+
+  const label = (typeof rawCit === "string" ? rawCit : rawCit?.label || "").trim();
+  const low = label.toLowerCase();
+  if (
+    !label ||
+    ["unavailable", "not available", "n/a", "none", "missing", "unspecified"].some((u) =>
+      low.includes(u)
+    )
+  ) {
+    return { label: label || "Source", kind: "unavailable", url: null, section_id: null, available: false };
+  }
+
+  const report = pullData?.report;
+  const fundamentals = pullData?.fundamentals;
+  const sourcesUsed = report?.sources_used;
+  const rawSc = (sourcesUsed?.screener_url || fundamentals?.screener_url || "").trim();
+  const baseSc = /^https?:\/\//i.test(rawSc) ? rawSc.split("#")[0] : "";
+
+  const docsParsed = sourcesUsed?.documents_parsed || [];
+  const concalls = fundamentals?.concalls || sourcesUsed?.concalls_available || [];
+  const annualReports = fundamentals?.annual_reports || sourcesUsed?.annual_reports_available || [];
+  const filings = sourcesUsed?.material_filings || [];
+
+  // 1. Internal Synthesized Report sections
+  if (
+    [
+      "synthesized report",
+      "pull report",
+      "research report",
+      "narrative vs",
+      "4q audit",
+      "quarters audit",
+      "bull vs",
+      "bull/bear",
+      "business snapshot",
+      "financial snapshot",
+      "cash quality",
+      "forward guidance",
+      "trajectory",
+    ].some((k) => low.includes(k))
+  ) {
+    let secId = "pull-report-overview";
+    if (["narrative", "4q", "audit", "promise"].some((k) => low.includes(k))) {
+      secId = "pull-module-narrative";
+    } else if (["trajectory", "growing", "compressing", "series"].some((k) => low.includes(k))) {
+      secId = "pull-module-trajectory";
+    } else if (["cash", "cfo", "balance sheet", "leverage", "borrowing"].some((k) => low.includes(k))) {
+      secId = "pull-module-cash-bs";
+    } else if (["guidance", "target", "outlook", "tone"].some((k) => low.includes(k))) {
+      secId = "pull-module-guidance";
+    } else if (["bull", "bear", "risk", "debate"].some((k) => low.includes(k))) {
+      secId = "pull-module-bull-bear";
+    } else if (["snapshot", "segment", "kpi", "overview", "business"].some((k) => low.includes(k))) {
+      secId = "pull-module-snapshot";
+    }
+    return {
+      label,
+      kind: "internal_report",
+      url: `#${secId}`,
+      section_id: secId,
+      available: true,
+    };
+  }
+
+  // 2. Primary Documents: Annual Reports
+  if (low.includes("annual report") || /\bar\b/.test(low)) {
+    const arCandidates: { titleLow: string; url: string }[] = [];
+    for (const ar of annualReports) {
+      const u = (ar.url || "").trim();
+      if (/^https?:\/\//i.test(u)) {
+        arCandidates.push({ titleLow: (ar.title || "").toLowerCase(), url: u });
+      }
+    }
+    for (const d of docsParsed) {
+      if ((d.doc_type || "").toLowerCase().includes("annual")) {
+        const u = (d.url || "").trim();
+        if (/^https?:\/\//i.test(u)) {
+          arCandidates.push({ titleLow: (d.period || "").toLowerCase(), url: u });
+        }
+      }
+    }
+
+    const yrMatch = low.match(/\b(20\d{2})\b/);
+    const fyMatch = low.match(/\bfy\s*'?(\d{2})\b/);
+    const targetYear = yrMatch ? yrMatch[1] : fyMatch ? `20${fyMatch[1]}` : null;
+
+    let matchedUrl: string | null = null;
+    if (targetYear) {
+      const hit = arCandidates.find(
+        (c) => c.titleLow.includes(targetYear) || c.titleLow.includes(`fy${targetYear.slice(-2)}`)
+      );
+      matchedUrl = hit ? hit.url : null;
+    } else if (arCandidates.length > 0) {
+      matchedUrl = arCandidates[0].url;
+    }
+
+    return {
+      label,
+      kind: matchedUrl ? "document" : "unavailable",
+      url: matchedUrl,
+      section_id: null,
+      available: Boolean(matchedUrl),
+    };
+  }
+
+  // 3. Primary Documents: Concalls / Transcripts / Investor Presentations / PPTs
+  if (
+    ["concall", "transcript", "earnings call", "conference call", "presentation", "ppt", "investor deck"].some(
+      (k) => low.includes(k)
+    )
+  ) {
+    const wantsPpt = ["ppt", "presentation", "deck"].some((k) => low.includes(k));
+    const ccEntries: {
+      period: string;
+      transcript_url?: string;
+      ppt_url?: string;
+      url?: string;
+      audio_url?: string;
+    }[] = [...concalls];
+
+    for (const d of docsParsed) {
+      if (!(d.doc_type || "").toLowerCase().includes("annual")) {
+        ccEntries.push({
+          period: d.period || "",
+          transcript_url: (d.doc_type || "").toLowerCase().includes("transcript") ? d.url : "",
+          ppt_url: (d.doc_type || "").toLowerCase().includes("presentation") ? d.url : "",
+          url: d.url || "",
+        });
+      }
+    }
+
+    const pickUrl = (entry: {
+      transcript_url?: string;
+      ppt_url?: string;
+      url?: string;
+      audio_url?: string;
+    }): string | null => {
+      const candidates = wantsPpt
+        ? [entry.ppt_url, entry.url, entry.transcript_url, entry.audio_url]
+        : [entry.transcript_url, entry.url, entry.ppt_url, entry.audio_url];
+      for (const c of candidates) {
+        const v = (c || "").trim();
+        if (/^https?:\/\//i.test(v)) return v;
+      }
+      return null;
+    };
+
+    const explicitMonths = MONTH_TOKENS.filter((m) => new RegExp(`\\b${m}[a-z]*\\b`).test(low));
+    const explicitYearMatch = low.match(/\b(20\d{2})\b/);
+    const explicitYear = explicitYearMatch ? explicitYearMatch[1] : null;
+    const { months: qMonths, year: qYear } = quarterToConcallMonths(low);
+    const hasSpecificPeriod =
+      explicitMonths.length > 0 || Boolean(explicitYear) || qMonths.length > 0;
+
+    let matchedCcUrl: string | null = null;
+    if (explicitMonths.length > 0 || explicitYear) {
+      for (const entry of ccEntries) {
+        const pLow = (entry.period || "").toLowerCase();
+        const monthOk =
+          explicitMonths.length > 0 ? explicitMonths.every((m) => pLow.includes(m)) : true;
+        const yearOk = explicitYear ? pLow.includes(explicitYear) : true;
+        if (monthOk && yearOk) {
+          matchedCcUrl = pickUrl(entry);
+          if (matchedCcUrl) break;
+        }
+      }
+    }
+
+    if (!matchedCcUrl && qMonths.length > 0) {
+      for (const entry of ccEntries) {
+        const pLow = (entry.period || "").toLowerCase();
+        if (qMonths.some((m) => pLow.includes(m)) && (!qYear || pLow.includes(qYear))) {
+          matchedCcUrl = pickUrl(entry);
+          if (matchedCcUrl) break;
+        }
+      }
+    }
+
+    if (!hasSpecificPeriod && !matchedCcUrl) {
+      for (const entry of ccEntries) {
+        matchedCcUrl = pickUrl(entry);
+        if (matchedCcUrl) break;
+      }
+    }
+
+    return {
+      label,
+      kind: matchedCcUrl ? "document" : "unavailable",
+      url: matchedCcUrl,
+      section_id: null,
+      available: Boolean(matchedCcUrl),
+    };
+  }
+
+  // 4. Exchange Filings / Press Releases
+  if (["filing", "announcement", "exchange", "press release", "bse", "nse"].some((k) => low.includes(k))) {
+    const fHit = filings.find((f) => /^https?:\/\//i.test((f.pdf_url || "").trim()));
+    return {
+      label,
+      kind: fHit ? "document" : "unavailable",
+      url: fHit ? fHit.pdf_url : null,
+      section_id: null,
+      available: Boolean(fHit),
+    };
+  }
+
+  // 5. Screener Financial Tables & Ratios
+  if (
+    baseSc &&
+    [
+      "screener",
+      "table",
+      "quarter",
+      "q1",
+      "q2",
+      "q3",
+      "q4",
+      "balance sheet",
+      "cash flow",
+      "cfo",
+      "profit & loss",
+      "profit and loss",
+      "p&l",
+      "income statement",
+      "ratio",
+      "roce",
+      "roe",
+      "working capital",
+      "10y",
+      "financial",
+      "fy2",
+      "mar 20",
+      "jun 20",
+      "sep 20",
+      "dec 20",
+    ].some((k) => low.includes(k))
+  ) {
+    let scUrl = baseSc;
+    if (low.includes("balance sheet")) {
+      scUrl = `${baseSc}#balance-sheet`;
+    } else if (low.includes("cash flow") || low.includes("cfo")) {
+      scUrl = `${baseSc}#cash-flow`;
+    } else if (
+      ["profit & loss", "profit and loss", "p&l", "income statement", "10y", "annual p&l"].some((k) =>
+        low.includes(k)
+      )
+    ) {
+      scUrl = `${baseSc}#profit-loss`;
+    } else if (low.includes("top ratio") || low.includes("market cap") || low.includes("valuation")) {
+      scUrl = `${baseSc}#top`;
+    } else if (
+      ["ratio", "working capital", "roce", "roe", "cash conversion"].some((k) => low.includes(k))
+    ) {
+      scUrl = `${baseSc}#ratios`;
+    } else if (
+      ["quarter", "q1", "q2", "q3", "q4", "table", "jun ", "sep ", "dec ", "mar "].some((k) =>
+        low.includes(k)
+      )
+    ) {
+      scUrl = `${baseSc}#quarters`;
+    }
+    return {
+      label,
+      kind: "webpage",
+      url: scUrl,
+      section_id: null,
+      available: true,
+    };
+  }
+
+  return {
+    label,
+    kind: "unavailable",
+    url: null,
+    section_id: null,
+    available: false,
+  };
+}
+
+function SourceBadge({
+  link,
+  onJumpToSection,
+}: {
+  link: CopilotCitationLink;
+  onJumpToSection: (sectionId: string, label: string) => void;
+}) {
+  if (!link.available || link.kind === "unavailable") {
+    return (
+      <span
+        aria-disabled="true"
+        title="Direct source link is unavailable in primary filings"
+        className="inline-flex items-center gap-1 rounded bg-zinc-900/60 border border-zinc-700/70 px-2 py-0.5 text-[9.5px] font-mono text-zinc-500 cursor-not-allowed"
+      >
+        <AlertCircle className="w-2.5 h-2.5 shrink-0 text-amber-500/70" />
+        <span>{link.label}</span>
+        <span className="text-[8.5px] uppercase text-amber-400/80">(Unavailable)</span>
+      </span>
+    );
+  }
+
+  if (link.kind === "internal_report" && link.section_id) {
+    return (
+      <a
+        href={`#${link.section_id}`}
+        onClick={(e) => {
+          e.preventDefault();
+          onJumpToSection(link.section_id!, link.label);
+        }}
+        title={`Open section in synthesized report: ${link.label}`}
+        className="inline-flex items-center gap-1 rounded bg-zinc-900 hover:bg-emerald-950/80 border border-emerald-500/35 hover:border-emerald-400 px-2 py-0.5 text-[9.5px] font-mono text-emerald-300 hover:text-emerald-200 transition cursor-pointer"
+      >
+        <BookOpen className="w-2.5 h-2.5 shrink-0" />
+        <span>{link.label}</span>
+        <span className="text-[8.5px] uppercase text-emerald-400/90">↘ Report</span>
+      </a>
+    );
+  }
+
+  return (
+    <a
+      href={link.url || "#"}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={`Open supporting ${link.kind === "document" ? "primary filing PDF" : "Screener financial table"}: ${link.label}`}
+      className="inline-flex items-center gap-1 rounded bg-zinc-900 hover:bg-cyan-950/80 border border-cyan-500/35 hover:border-cyan-400 px-2 py-0.5 text-[9.5px] font-mono text-cyan-300 hover:text-cyan-200 transition cursor-pointer"
+    >
+      <FileText className="w-2.5 h-2.5 shrink-0" />
+      <span>{link.label}</span>
+      <ExternalLink className="w-2.5 h-2.5 shrink-0 opacity-85" />
+    </a>
+  );
+}
+
 export function PullTab({
   pullData,
   loading,
@@ -261,6 +802,35 @@ export function PullTab({
   const [asking, setAsking] = useState(false);
   const [qaHistory, setQaHistory] = useState<CopilotQAResponse[]>([]);
   const [qaError, setQaError] = useState<string | null>(null);
+  const [highlightedSection, setHighlightedSection] = useState<{
+    id: string;
+    label: string;
+  } | null>(null);
+  const askReqIdRef = useRef<number>(0);
+  const askAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    askReqIdRef.current += 1;
+    if (askAbortRef.current) {
+      askAbortRef.current.abort();
+      askAbortRef.current = null;
+    }
+    setAsking(false);
+    setQaError(null);
+    setQuestion("");
+    setHighlightedSection(null);
+  }, [activeTicker]);
+
+  function handleJumpToSection(sectionId: string, label: string) {
+    setHighlightedSection({ id: sectionId, label });
+    if (typeof window !== "undefined") {
+      window.history.replaceState(null, "", `#${sectionId}`);
+      const el = document.getElementById(sectionId);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    }
+  }
 
   const cachedSet = new Set(cachedReports.map((c) => c.ticker));
 
@@ -324,15 +894,28 @@ export function PullTab({
 
   async function handleAskQuestion(qText: string) {
     const cleanQ = qText.trim();
-    if (!cleanQ || !pullData?.ticker) return;
+    const targetTicker = pullData?.ticker?.trim().toUpperCase();
+    if (!cleanQ || !targetTicker || targetTicker !== activeTicker.toUpperCase()) return;
+
+    const reqId = ++askReqIdRef.current;
+    if (askAbortRef.current) {
+      askAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    askAbortRef.current = controller;
+
     try {
       setAsking(true);
       setQaError(null);
-      const res = await finnApi.askPullCopilot(pullData.ticker, cleanQ);
+      const res = await finnApi.askPullCopilot(targetTicker, cleanQ, controller.signal);
+      if (reqId !== askReqIdRef.current) return;
+      if ((res.ticker || "").toUpperCase() !== targetTicker) return;
       setQaHistory((prev) => [res, ...prev]);
       setQuestion("");
       onCostUpdated();
     } catch (err) {
+      if (reqId !== askReqIdRef.current) return;
+      if (err instanceof Error && err.name === "AbortError") return;
       const rawMsg = err instanceof Error ? err.message : "Unable to reach Copilot right now.";
       const friendly =
         rawMsg.includes("HTTPSConnectionPool") || rawMsg.includes("WinError 10013")
@@ -342,12 +925,19 @@ export function PullTab({
           : rawMsg;
       setQaError(friendly);
     } finally {
-      setAsking(false);
+      if (reqId === askReqIdRef.current) {
+        setAsking(false);
+      }
     }
   }
 
-  const report = pullData?.report;
-  const eod = pullData?.eod;
+  const isMatchingReport = Boolean(
+    pullData &&
+      pullData.ticker &&
+      pullData.ticker.toUpperCase() === activeTicker.toUpperCase()
+  );
+  const report = isMatchingReport ? pullData?.report : undefined;
+  const eod = isMatchingReport ? pullData?.eod : undefined;
   const companyName =
     pullData?.fundamentals?.company_name || eod?.company_name || pullData?.ticker;
 
@@ -369,7 +959,7 @@ export function PullTab({
             </div>
             <button
               type="submit"
-              disabled={loading}
+              disabled={!searchInput.trim()}
               className="rounded-lg bg-emerald-500 hover:bg-emerald-400 px-3 py-1.5 text-xs font-bold text-zinc-950 transition disabled:opacity-50"
             >
               Analyze
@@ -502,17 +1092,48 @@ export function PullTab({
 
       {/* Error State */}
       {!loading && error && (
-        <div className="rounded-xl border border-rose-500/30 bg-rose-950/20 p-4 text-xs text-rose-300">
-          <div className="font-bold mb-1">Research Synthesis Error</div>
-          <p>{error}</p>
+        <div className="rounded-xl border border-rose-500/30 bg-rose-950/20 p-4 text-xs text-rose-300 space-y-2">
+          <div className="flex items-center justify-between gap-2">
+            <div className="font-bold">
+              Research Synthesis Error ({activeTicker})
+            </div>
+            <button
+              type="button"
+              onClick={() => onSelectTicker(activeTicker, false)}
+              className="inline-flex items-center gap-1 rounded bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 px-2 py-1 text-[10px] font-mono text-rose-200 transition"
+            >
+              <RefreshCw className="w-2.5 h-2.5" />
+              <span>Retry</span>
+            </button>
+          </div>
+          <p className="leading-relaxed">{error}</p>
         </div>
       )}
 
-      {/* Loaded Report Content */}
-      {!loading && pullData && report && (
+      {/* Loaded Report Content (strictly guarded to match activeTicker and have no error) */}
+      {!loading && !error && isMatchingReport && pullData && report && (
         <>
           {/* Company Header + Cache/Cost Telemetry + Primary Source Pills */}
-          <div className="rounded-xl border border-zinc-800 bg-zinc-900/90 p-3.5">
+          <div
+            id="pull-report-overview"
+            className={`rounded-xl border bg-zinc-900/90 p-3.5 transition ${
+              highlightedSection?.id === "pull-report-overview"
+                ? "border-emerald-400 ring-2 ring-emerald-400/50"
+                : "border-zinc-800"
+            }`}
+          >
+            {highlightedSection?.id === "pull-report-overview" && (
+              <div className="mb-2 flex items-center justify-between rounded bg-emerald-500/15 border border-emerald-500/35 px-2 py-1 text-[10px] font-mono text-emerald-300">
+                <span>Viewing Cited Report: {highlightedSection.label}</span>
+                <button
+                  type="button"
+                  onClick={() => setHighlightedSection(null)}
+                  className="text-zinc-400 hover:text-white"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
             <div className="flex items-start justify-between gap-2">
               <div>
                 <div className="flex items-center gap-2">
@@ -718,18 +1339,21 @@ export function PullTab({
                           Cited Filing Answer
                         </span>
                       </div>
-                      <div className="text-xs text-zinc-100 whitespace-pre-line leading-relaxed">
-                        {item.answer}
+                      <div className="text-xs text-zinc-100 leading-relaxed">
+                        <FormattedMarkdown content={item.answer} />
                       </div>
-                      {(item.citations || []).length > 0 && (
-                        <div className="flex flex-wrap gap-1 pt-1.5 border-t border-zinc-800/80">
-                          {item.citations.map((cit, ci) => (
-                            <span
+                      {((item.citation_links && item.citation_links.length > 0) ||
+                        (item.citations && item.citations.length > 0)) && (
+                        <div className="flex flex-wrap gap-1.5 pt-1.5 border-t border-zinc-800/80">
+                          {(item.citation_links && item.citation_links.length > 0
+                            ? item.citation_links
+                            : item.citations
+                          ).map((cit, ci) => (
+                            <SourceBadge
                               key={ci}
-                              className="rounded bg-zinc-900 border border-cyan-500/25 px-1.5 py-0.5 text-[9.5px] font-mono text-cyan-300"
-                            >
-                              📄 {cit}
-                            </span>
+                              link={resolveCitationLink(cit, pullData)}
+                              onJumpToSection={handleJumpToSection}
+                            />
                           ))}
                         </div>
                       )}
@@ -740,7 +1364,26 @@ export function PullTab({
           </div>
 
           {/* MODULE 1 (HERO WORKED EXAMPLE): NARRATIVE VS. NUMBERS (4-QUARTER AUDIT) */}
-          <div className="rounded-xl border-2 border-emerald-500/35 bg-gradient-to-b from-emerald-950/25 via-zinc-900/95 to-zinc-900/95 p-3.5 shadow-lg">
+          <div
+            id="pull-module-narrative"
+            className={`rounded-xl border-2 bg-gradient-to-b from-emerald-950/25 via-zinc-900/95 to-zinc-900/95 p-3.5 shadow-lg transition ${
+              highlightedSection?.id === "pull-module-narrative"
+                ? "border-emerald-400 ring-2 ring-emerald-400/60"
+                : "border-emerald-500/35"
+            }`}
+          >
+            {highlightedSection?.id === "pull-module-narrative" && (
+              <div className="mb-2 flex items-center justify-between rounded bg-emerald-500/15 border border-emerald-500/35 px-2 py-1 text-[10px] font-mono text-emerald-300">
+                <span>Viewing Cited Section: {highlightedSection.label}</span>
+                <button
+                  type="button"
+                  onClick={() => setHighlightedSection(null)}
+                  className="text-zinc-400 hover:text-white"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
             <div className="flex items-start justify-between gap-2 pb-2.5 border-b border-zinc-800">
               <div className="flex items-center gap-2">
                 <div className="p-1.5 rounded-lg bg-emerald-500/20 text-emerald-400">
@@ -764,7 +1407,7 @@ export function PullTab({
 
             {report.narrative_vs_numbers?.synthesis && (
               <p className="mt-2.5 text-xs leading-relaxed text-zinc-200 bg-zinc-950/70 rounded-lg p-2.5 border border-zinc-800/80">
-                {report.narrative_vs_numbers.synthesis}
+                {renderInlineMarkdown(report.narrative_vs_numbers.synthesis)}
               </p>
             )}
 
@@ -787,7 +1430,7 @@ export function PullTab({
                         Management Narrative / Guidance
                       </div>
                       <p className="text-zinc-300 leading-snug">
-                        {q.management_narrative}
+                        {renderInlineMarkdown(q.management_narrative)}
                       </p>
                     </div>
 
@@ -796,7 +1439,7 @@ export function PullTab({
                         Actual Reported Numbers
                       </div>
                       <p className="text-zinc-200 font-medium leading-snug">
-                        {q.actual_numbers}
+                        {renderInlineMarkdown(q.actual_numbers)}
                       </p>
                     </div>
                   </div>
@@ -804,7 +1447,7 @@ export function PullTab({
                   {q.audit_note && (
                     <div className="text-[11px] text-amber-300/95 pt-1 border-t border-zinc-800/60">
                       <span className="font-semibold">Audit Verdict: </span>
-                      {q.audit_note}
+                      {renderInlineMarkdown(q.audit_note)}
                     </div>
                   )}
                 </div>
@@ -813,7 +1456,26 @@ export function PullTab({
           </div>
 
           {/* MODULE 2 & 3: FINANCIAL SNAPSHOT & BUSINESS SNAPSHOT */}
-          <div className="rounded-xl border border-zinc-800 bg-zinc-900/85 p-3.5 space-y-3">
+          <div
+            id="pull-module-snapshot"
+            className={`rounded-xl border bg-zinc-900/85 p-3.5 space-y-3 transition ${
+              highlightedSection?.id === "pull-module-snapshot"
+                ? "border-emerald-400 ring-2 ring-emerald-400/60"
+                : "border-zinc-800"
+            }`}
+          >
+            {highlightedSection?.id === "pull-module-snapshot" && (
+              <div className="mb-1 flex items-center justify-between rounded bg-emerald-500/15 border border-emerald-500/35 px-2 py-1 text-[10px] font-mono text-emerald-300">
+                <span>Viewing Cited Section: {highlightedSection.label}</span>
+                <button
+                  type="button"
+                  onClick={() => setHighlightedSection(null)}
+                  className="text-zinc-400 hover:text-white"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <BookOpen className="w-4 h-4 text-cyan-400" />
@@ -856,13 +1518,13 @@ export function PullTab({
 
             {report.financial_snapshot?.headline_summary && (
               <p className="text-xs text-emerald-300/90 bg-emerald-500/10 border border-emerald-500/20 rounded-lg p-2">
-                {report.financial_snapshot.headline_summary}
+                {renderInlineMarkdown(report.financial_snapshot.headline_summary)}
               </p>
             )}
 
             {report.business_snapshot?.overview && (
               <p className="text-xs text-zinc-300 leading-relaxed">
-                {report.business_snapshot.overview}
+                {renderInlineMarkdown(report.business_snapshot.overview)}
               </p>
             )}
 
@@ -883,7 +1545,7 @@ export function PullTab({
                         {seg.contribution}
                       </span>
                     </div>
-                    <p className="text-zinc-400 mt-0.5">{seg.driver}</p>
+                    <p className="text-zinc-400 mt-0.5">{renderInlineMarkdown(seg.driver)}</p>
                   </div>
                 ))}
               </div>
@@ -897,7 +1559,7 @@ export function PullTab({
                     key={i}
                     className="rounded-md bg-zinc-800/90 border border-zinc-700/70 px-2 py-0.5 text-[10px] text-zinc-300"
                   >
-                    ⚡ {lev}
+                    ⚡ {renderInlineMarkdown(lev)}
                   </span>
                 ))}
               </div>
@@ -905,7 +1567,26 @@ export function PullTab({
           </div>
 
           {/* MODULE 4: MULTI-YEAR & QUARTERLY TRAJECTORY */}
-          <div className="rounded-xl border border-zinc-800 bg-zinc-900/85 p-3.5 space-y-2.5">
+          <div
+            id="pull-module-trajectory"
+            className={`rounded-xl border bg-zinc-900/85 p-3.5 space-y-2.5 transition ${
+              highlightedSection?.id === "pull-module-trajectory"
+                ? "border-emerald-400 ring-2 ring-emerald-400/60"
+                : "border-zinc-800"
+            }`}
+          >
+            {highlightedSection?.id === "pull-module-trajectory" && (
+              <div className="mb-1 flex items-center justify-between rounded bg-emerald-500/15 border border-emerald-500/35 px-2 py-1 text-[10px] font-mono text-emerald-300">
+                <span>Viewing Cited Section: {highlightedSection.label}</span>
+                <button
+                  type="button"
+                  onClick={() => setHighlightedSection(null)}
+                  className="text-zinc-400 hover:text-white"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <BarChart3 className="w-4 h-4 text-emerald-400" />
@@ -940,7 +1621,7 @@ export function PullTab({
             </div>
 
             <p className="text-xs text-zinc-300 leading-relaxed">
-              {report.trajectory?.summary}
+              {renderInlineMarkdown(report.trajectory?.summary)}
             </p>
 
             <TrajectoryChart
@@ -959,7 +1640,7 @@ export function PullTab({
                 </div>
                 <ul className="space-y-1 text-[11px] text-zinc-300 list-disc list-inside">
                   {(report.trajectory?.whats_growing || []).map((g, i) => (
-                    <li key={i}>{g}</li>
+                    <li key={i}>{renderInlineMarkdown(g)}</li>
                   ))}
                 </ul>
               </div>
@@ -971,7 +1652,7 @@ export function PullTab({
                 </div>
                 <ul className="space-y-1 text-[11px] text-zinc-300 list-disc list-inside">
                   {(report.trajectory?.whats_compressing || []).map((c, i) => (
-                    <li key={i}>{c}</li>
+                    <li key={i}>{renderInlineMarkdown(c)}</li>
                   ))}
                 </ul>
               </div>
@@ -979,7 +1660,26 @@ export function PullTab({
           </div>
 
           {/* MODULE 5 & 6: CASH QUALITY & BALANCE SHEET */}
-          <div className="rounded-xl border border-zinc-800 bg-zinc-900/85 p-3.5 space-y-3">
+          <div
+            id="pull-module-cash-bs"
+            className={`rounded-xl border bg-zinc-900/85 p-3.5 space-y-3 transition ${
+              highlightedSection?.id === "pull-module-cash-bs"
+                ? "border-emerald-400 ring-2 ring-emerald-400/60"
+                : "border-zinc-800"
+            }`}
+          >
+            {highlightedSection?.id === "pull-module-cash-bs" && (
+              <div className="mb-1 flex items-center justify-between rounded bg-emerald-500/15 border border-emerald-500/35 px-2 py-1 text-[10px] font-mono text-emerald-300">
+                <span>Viewing Cited Section: {highlightedSection.label}</span>
+                <button
+                  type="button"
+                  onClick={() => setHighlightedSection(null)}
+                  className="text-zinc-400 hover:text-white"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Coins className="w-4 h-4 text-emerald-400" />
@@ -1020,7 +1720,7 @@ export function PullTab({
             </div>
 
             <p className="text-xs text-zinc-300 leading-relaxed">
-              {report.cash_quality?.summary}
+              {renderInlineMarkdown(report.cash_quality?.summary)}
             </p>
 
             <CashVsPatChart series={report.cash_quality?.annual_cash_vs_pat || []} />
@@ -1063,13 +1763,32 @@ export function PullTab({
               )}
 
               <p className="text-xs text-zinc-400 leading-relaxed">
-                {report.balance_sheet?.summary}
+                {renderInlineMarkdown(report.balance_sheet?.summary)}
               </p>
             </div>
           </div>
 
           {/* MODULE 7: FORWARD GUIDANCE */}
-          <div className="rounded-xl border border-zinc-800 bg-zinc-900/85 p-3.5 space-y-2.5">
+          <div
+            id="pull-module-guidance"
+            className={`rounded-xl border bg-zinc-900/85 p-3.5 space-y-2.5 transition ${
+              highlightedSection?.id === "pull-module-guidance"
+                ? "border-emerald-400 ring-2 ring-emerald-400/60"
+                : "border-zinc-800"
+            }`}
+          >
+            {highlightedSection?.id === "pull-module-guidance" && (
+              <div className="mb-1 flex items-center justify-between rounded bg-emerald-500/15 border border-emerald-500/35 px-2 py-1 text-[10px] font-mono text-emerald-300">
+                <span>Viewing Cited Section: {highlightedSection.label}</span>
+                <button
+                  type="button"
+                  onClick={() => setHighlightedSection(null)}
+                  className="text-zinc-400 hover:text-white"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Target className="w-4 h-4 text-amber-400" />
@@ -1083,7 +1802,7 @@ export function PullTab({
             </div>
 
             <p className="text-xs text-zinc-300 leading-relaxed">
-              {report.guidance?.summary}
+              {renderInlineMarkdown(report.guidance?.summary)}
             </p>
 
             <div className="space-y-1.5">
@@ -1094,18 +1813,42 @@ export function PullTab({
                 >
                   <div className="flex items-center justify-between gap-2">
                     <span className="font-semibold text-amber-300">{t.metric}</span>
-                    <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-[9px] font-mono text-zinc-400">
-                      {t.source}
-                    </span>
+                    {t.source && (
+                      <SourceBadge
+                        link={resolveCitationLink(t.source, pullData)}
+                        onJumpToSection={handleJumpToSection}
+                      />
+                    )}
                   </div>
-                  <p className="text-zinc-200 mt-1 leading-snug">{t.target}</p>
+                  <p className="text-zinc-200 mt-1 leading-snug">
+                    {renderInlineMarkdown(t.target)}
+                  </p>
                 </div>
               ))}
             </div>
           </div>
 
           {/* MODULE 8: BULL VS. BEAR INSTITUTIONAL DEBATE */}
-          <div className="rounded-xl border border-zinc-800 bg-zinc-900/85 p-3.5 space-y-2.5">
+          <div
+            id="pull-module-bull-bear"
+            className={`rounded-xl border bg-zinc-900/85 p-3.5 space-y-2.5 transition ${
+              highlightedSection?.id === "pull-module-bull-bear"
+                ? "border-emerald-400 ring-2 ring-emerald-400/60"
+                : "border-zinc-800"
+            }`}
+          >
+            {highlightedSection?.id === "pull-module-bull-bear" && (
+              <div className="mb-1 flex items-center justify-between rounded bg-emerald-500/15 border border-emerald-500/35 px-2 py-1 text-[10px] font-mono text-emerald-300">
+                <span>Viewing Cited Section: {highlightedSection.label}</span>
+                <button
+                  type="button"
+                  onClick={() => setHighlightedSection(null)}
+                  className="text-zinc-400 hover:text-white"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
             <h2 className="text-xs font-bold uppercase tracking-wider text-white">
               Bull vs. Bear Primary-Source Case
             </h2>
@@ -1119,7 +1862,7 @@ export function PullTab({
                   {(report.bull_vs_bear?.bull_case || []).map((pt, i) => (
                     <li key={i} className="flex items-start gap-1.5">
                       <span className="text-emerald-400 font-bold">•</span>
-                      <span>{pt}</span>
+                      <span>{renderInlineMarkdown(pt)}</span>
                     </li>
                   ))}
                 </ul>
@@ -1133,7 +1876,7 @@ export function PullTab({
                   {(report.bull_vs_bear?.bear_case || []).map((pt, i) => (
                     <li key={i} className="flex items-start gap-1.5">
                       <span className="text-rose-400 font-bold">•</span>
-                      <span>{pt}</span>
+                      <span>{renderInlineMarkdown(pt)}</span>
                     </li>
                   ))}
                 </ul>

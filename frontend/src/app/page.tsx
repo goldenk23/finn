@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   Radio,
   Bell,
@@ -53,6 +53,8 @@ export default function FinnAppPage() {
   const [pullLoading, setPullLoading] = useState<boolean>(false);
   const [pullError, setPullError] = useState<string | null>(null);
   const [cachedReports, setCachedReports] = useState<CachedReportMeta[]>([]);
+  const pullReqIdRef = useRef<number>(0);
+  const pullAbortRef = useRef<AbortController | null>(null);
 
   // Cost Telemetry Drawer state
   const [costData, setCostData] = useState<CostSummaryResponse | null>(null);
@@ -114,22 +116,41 @@ export default function FinnAppPage() {
 
   const loadPullReport = useCallback(
     async (ticker: string, force = false) => {
-      const clean = ticker.trim().toUpperCase();
+      const clean = ticker.trim().toUpperCase().replace(".NS", "").replace(".BO", "");
       if (!clean) return;
+
+      const reqId = ++pullReqIdRef.current;
+      if (pullAbortRef.current) {
+        pullAbortRef.current.abort();
+      }
+      const controller = new AbortController();
+      pullAbortRef.current = controller;
+
       setActivePullTicker(clean);
+      setPullLoading(true);
+      setPullError(null);
+      setPullData(null);
+
       try {
-        setPullLoading(true);
-        setPullError(null);
-        const res = await finnApi.getPullReport(clean, force);
+        const res = await finnApi.getPullReport(clean, force, controller.signal);
+        if (reqId !== pullReqIdRef.current) return;
+        if ((res.ticker || "").toUpperCase() !== clean) {
+          throw new Error(`Mismatched report ticker returned (${res.ticker} vs ${clean})`);
+        }
         setPullData(res);
-        await loadTelemetryAndCache();
-        await loadPortfolio();
+        void loadTelemetryAndCache();
+        void loadPortfolio();
       } catch (err) {
+        if (reqId !== pullReqIdRef.current) return;
+        if (err instanceof Error && err.name === "AbortError") return;
+        setPullData(null);
         setPullError(
           err instanceof Error ? err.message : "Failed to load Pull research"
         );
       } finally {
-        setPullLoading(false);
+        if (reqId === pullReqIdRef.current) {
+          setPullLoading(false);
+        }
       }
     },
     [loadTelemetryAndCache, loadPortfolio]
@@ -181,12 +202,15 @@ export default function FinnAppPage() {
   }
 
   function handleOpenPullFromAnywhere(ticker: string) {
+    const clean = ticker.trim().toUpperCase().replace(".NS", "").replace(".BO", "");
     setActiveTab("pull");
     if (
+      activePullTicker.toUpperCase() !== clean ||
       !pullData ||
-      pullData.ticker.toUpperCase() !== ticker.trim().toUpperCase()
+      pullData.ticker.toUpperCase() !== clean ||
+      Boolean(pullError)
     ) {
-      loadPullReport(ticker, false);
+      loadPullReport(clean, false);
     }
   }
 

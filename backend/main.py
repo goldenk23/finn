@@ -12,8 +12,9 @@ logger = logging.getLogger("finn.api")
 
 def _sanitize_log_message(msg: str) -> str:
     """Strip any potential API key or bearer token substrings before logging."""
-    s = re.sub(r"(key|token|access_token)=[^&\s\"']+", r"\1=[REDACTED]", msg, flags=re.IGNORECASE)
-    s = re.sub(r"AIza[0-9A-Za-z\-_]{20,}", "[REDACTED_KEY]", s)
+    s = re.sub(r"(key|token|access_token|secret)=[^&\s\"']+", r"\1=[REDACTED]", msg, flags=re.IGNORECASE)
+    s = re.sub(r"Bearer\s+[0-9A-Za-z\-._~+/]+=*", "Bearer [REDACTED]", s, flags=re.IGNORECASE)
+    s = re.sub(r"(AIza|AQ\.|ya29\.)[0-9A-Za-z\-_]{16,}", "[REDACTED_KEY]", s)
     return s
 
 
@@ -26,6 +27,11 @@ def _friendly_upstream_error(context: str, exc: Exception) -> HTTPException:
     logger.error("[%s] Upstream failure: %s", context, raw)
 
     low = raw.lower()
+    if isinstance(exc, ValueError) and "could not find ticker" in low:
+        return HTTPException(
+            status_code=404,
+            detail=str(exc),
+        )
     if any(
         k in low
         for k in (

@@ -1,0 +1,10 @@
+flowchart TB
+    A["Select Ticker or company<br/>Ticker (exchange trading code, such as HDFCBANK)"] --> B["Click Analyze"]
+    B --> C{"Saved report for this company?<br/>Re-run bypasses this check"}
+    C -->|"Yes"| D["Return saved report and tables<br/>Attach latest stored price data"]
+    C -->|"No, or Re-run"| E["Fetch Screener tables and document links<br/>Read recent NSE / BSE announcements"]
+    E --> F["Read selected PDF pages<br/>Concall (management discussion of results)<br/>Investor Presentation (company briefing slides)<br/>Annual Report (yearly company report)"]
+    F --> G["Map: Flash extracts management statements<br/>Reduce: Pro combines evidence into 8 research modules"]
+    G --> H["Save report, tables, source references, and AI usage"]
+    H --> I["Return report to Pull Deep"]
+    D --> I

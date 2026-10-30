@@ -14,21 +14,67 @@ import {
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  const fetchInit: RequestInit = {
     ...options,
     headers: {
       "Content-Type": "application/json",
       ...(options?.headers || {}),
     },
     cache: "no-store",
-  });
+  };
+
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${path}`, fetchInit);
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw err;
+    }
+    throw new Error(
+      "Cannot reach FINN backend server. Ensure FastAPI is running on port 8000."
+    );
+  }
+
+  // ponytail: if Next.js dev rewrite proxy drops a long-running synthesis with a bare non-JSON 500/502/504 on localhost, transparently retry direct against FastAPI (127.0.0.1:8000).
+  if (
+    !res.ok &&
+    res.status >= 500 &&
+    !API_BASE &&
+    typeof window !== "undefined" &&
+    (window.location.hostname === "127.0.0.1" || window.location.hostname === "localhost")
+  ) {
+    const contentType = res.headers.get("content-type") || "";
+    if (!contentType.includes("application/json")) {
+      try {
+        res = await fetch(`http://127.0.0.1:8000${path}`, fetchInit);
+      } catch (retryErr) {
+        if (retryErr instanceof Error && retryErr.name === "AbortError") {
+          throw retryErr;
+        }
+      }
+    }
+  }
+
   if (!res.ok) {
-    let detail = `HTTP ${res.status}`;
+    let detail = "";
     try {
       const err = await res.json();
-      if (err.detail) detail = err.detail;
+      if (typeof err?.detail === "string") {
+        detail = err.detail;
+      } else if (Array.isArray(err?.detail)) {
+        detail = err.detail.map((d: { msg?: string }) => d.msg || "").filter(Boolean).join("; ");
+      }
     } catch {
-      // ignore parse error
+      // non-JSON error body
+    }
+    if (!detail) {
+      if (res.status === 502 || res.status === 503 || res.status === 504) {
+        detail = `Research service is temporarily unavailable (HTTP ${res.status}). Verify backend connectivity and try again.`;
+      } else if (res.status >= 500) {
+        detail = `Backend synthesis failed or timed out (HTTP ${res.status}). Check backend logs and try again.`;
+      } else {
+        detail = `Request failed (HTTP ${res.status}).`;
+      }
     }
     throw new Error(detail);
   }
@@ -97,15 +143,17 @@ export const finnApi = {
   getCachedPullReports: () =>
     request<{ cached_reports: CachedReportMeta[] }>("/api/pull-cached"),
 
-  getPullReport: (ticker: string, force = false) =>
+  getPullReport: (ticker: string, force = false, signal?: AbortSignal) =>
     request<PullResponse>(
-      `/api/pull/${encodeURIComponent(ticker)}?force=${force ? "true" : "false"}`
+      `/api/pull/${encodeURIComponent(ticker)}?force=${force ? "true" : "false"}`,
+      signal ? { signal } : undefined
     ),
 
-  askPullCopilot: (ticker: string, question: string) =>
+  askPullCopilot: (ticker: string, question: string, signal?: AbortSignal) =>
     request<CopilotQAResponse>(`/api/pull/${encodeURIComponent(ticker)}/ask`, {
       method: "POST",
       body: JSON.stringify({ question }),
+      ...(signal ? { signal } : {}),
     }),
 
   getCostSummary: () => request<CostSummaryResponse>("/api/cost"),

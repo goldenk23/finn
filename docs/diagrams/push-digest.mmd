@@ -1,0 +1,7 @@
+flowchart TB
+    A["You click Refresh Live"] --> B["Read Portfolio (tracked companies)<br/>Selected company, or all tracked companies"]
+    B --> C["Fetch Yahoo Finance prices and volume (shares traded)<br/>Fetch NSE / BSE filings (official announcements)"]
+    C --> D["Save data; classify new announcements with Flash-Lite<br/>Apply rules identifying routine paperwork"]
+    D --> E["Use Flash to enrich selected Quarterly Results<br/>(three-month performance) and Key Management<br/>(senior leadership changes) cards"]
+    E --> F["Read selected time window; merge duplicate events<br/>Sort by category priority, then date"]
+    F --> G["Material Corporate Signals (important events)<br/>Routine / Low-Relevance Filings (collapsed paperwork)"]
