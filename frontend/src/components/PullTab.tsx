@@ -28,6 +28,7 @@ import {
   CopilotQAResponse,
   PortfolioItem,
   PullResponse,
+  RoutingTier,
   TrajectoryPoint,
 } from "@/types/finn";
 import { finnApi } from "@/lib/api";
@@ -41,6 +42,8 @@ interface PullTabProps {
   cachedReports: CachedReportMeta[];
   onSelectTicker: (ticker: string, force?: boolean) => void;
   onCostUpdated: () => void;
+  /** Configured primary model per tier (from /api/cost), shown before a response reports the real one. */
+  routing?: RoutingTier[];
 }
 
 const ADHOC_DEMO_TICKERS = ["DIXON", "POLYCAB", "INDHOTEL", "PERSISTENT"];
@@ -795,7 +798,9 @@ export function PullTab({
   cachedReports,
   onSelectTicker,
   onCostUpdated,
+  routing,
 }: PullTabProps) {
+  const tierModel = (tier: number) => routing?.find((t) => t.tier === tier)?.model;
   const [searchInput, setSearchInput] = useState("");
   const [trajMode, setTrajMode] = useState<"quarterly" | "annual">("quarterly");
   const [question, setQuestion] = useState("");
@@ -1084,7 +1089,7 @@ export function PullTab({
               <br />
               2. Extracting last 4 Concall Transcripts / Annual Report via PyMuPDF
               <br />
-              3. Running Map (Gemini 2.5 Flash) → Reduce (Gemini 2.5 Pro) 4Q Audit
+              3. Running Map ({tierModel(2) ?? "Tier 2"}) → Reduce ({tierModel(3) ?? "Tier 3"}) 4Q Audit
             </p>
           </div>
         </div>
@@ -1186,6 +1191,14 @@ export function PullTab({
                   Gen Cost: ${Number(pullData.cost_usd || 0).toFixed(4)} (
                   {((pullData.tokens_in + pullData.tokens_out) / 1000).toFixed(1)}k tok)
                 </span>
+                {report.models_used?.reduce && (
+                  <span
+                    className="text-[10px] font-mono text-purple-300"
+                    title={`Map: ${report.models_used.map ?? "not run"} · Reduce: ${report.models_used.reduce}`}
+                  >
+                    via {report.models_used.reduce}
+                  </span>
+                )}
               </div>
 
               <button
@@ -1256,7 +1269,7 @@ export function PullTab({
                 </div>
               </div>
               <span className="shrink-0 rounded bg-zinc-950/90 border border-zinc-800 px-1.5 py-0.5 text-[9px] font-mono text-cyan-300">
-                Tier 2 • Flash
+                {qaHistory.find((q) => q.model)?.model ?? tierModel(2) ?? "Tier 2"}
               </span>
             </div>
 

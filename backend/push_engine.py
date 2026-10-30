@@ -8,6 +8,7 @@ from backend.db import get_conn, get_portfolio, get_alert_rules, DB_PATH
 from backend.scrapers.market_data import fetch_eod_metrics
 from backend.scrapers.filings import fetch_company_filings, enforce_filing_hygiene
 from backend.llm_router import (
+    latest_model_for,
     classify_and_summarize_batch,
     enrich_quarterly_results,
     enrich_management_change,
@@ -334,6 +335,8 @@ def get_windowed_digest(
             "material_count": len(material),
             "routine_collapsed_count": len(routine),
             "noise_filtered_pct": noise_pct,
+            # Model that served the latest LLM triage batch (None = only the regex classifier has run)
+            "triage_model": latest_model_for("push_batch_triage", db_path=db_path),
         },
         "material": material,
         "routine": routine,

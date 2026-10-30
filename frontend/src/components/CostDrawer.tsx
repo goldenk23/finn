@@ -14,45 +14,52 @@ interface CostDrawerProps {
 const WORKFLOW_LABELS: Record<string, { label: string; tier: string; badgeCls: string }> = {
   push_batch_triage: {
     label: "Push: Bulk Filing Triage (17 Categories)",
-    tier: "Tier 1 • Flash-Lite",
+    tier: "Tier 1",
     badgeCls: "bg-emerald-500/15 text-emerald-300 border-emerald-500/30",
   },
   push_enrich_results_pdf: {
     label: "Push: Quarterly Results PDF Table Extraction",
-    tier: "Tier 2 • Flash",
+    tier: "Tier 2",
     badgeCls: "bg-cyan-500/15 text-cyan-300 border-cyan-500/30",
   },
   push_enrich_results_fallback: {
     label: "Push: Results Primary Table Extraction",
-    tier: "Tier 2 • Flash",
+    tier: "Tier 2",
     badgeCls: "bg-cyan-500/15 text-cyan-300 border-cyan-500/30",
   },
   push_mgmt_extract: {
     label: "Push: Executive Change PDF Extraction",
-    tier: "Tier 2 • Flash",
+    tier: "Tier 2",
     badgeCls: "bg-cyan-500/15 text-cyan-300 border-cyan-500/30",
   },
   push_mgmt_bio: {
     label: "Push: Executive Grounded Bio Synthesis",
-    tier: "Tier 2 • Flash",
+    tier: "Tier 2",
     badgeCls: "bg-cyan-500/15 text-cyan-300 border-cyan-500/30",
   },
   pull_concall_map: {
     label: "Pull [Map]: Concall & AR Guidance Extraction",
-    tier: "Tier 2 • Flash",
+    tier: "Tier 2",
     badgeCls: "bg-cyan-500/15 text-cyan-300 border-cyan-500/30",
   },
   pull_deep_synthesis: {
     label: "Pull [Reduce]: 8-Module & 4Q Narrative Audit",
-    tier: "Tier 3 • Pro",
+    tier: "Tier 3",
     badgeCls: "bg-purple-500/15 text-purple-300 border-purple-500/30",
   },
   pull_copilot_qa: {
     label: "Pull: Primary-Source Copilot Q&A",
-    tier: "Tier 2 • Flash",
+    tier: "Tier 2",
     badgeCls: "bg-cyan-500/15 text-cyan-300 border-cyan-500/30",
   },
+  probe: {
+    label: "One-off model availability probe",
+    tier: "Probe",
+    badgeCls: "bg-zinc-800 text-zinc-300 border-zinc-700",
+  },
 };
+
+const TIER_COLOR: Record<number, string> = { 1: "text-emerald-400", 2: "text-cyan-400", 3: "text-purple-400" };
 
 export function CostDrawer({
   open,
@@ -69,6 +76,7 @@ export function CostDrawer({
     cost_usd: 0,
   };
   const rows = costData?.by_workflow || [];
+  const routing = costData?.routing || [];
 
   return (
     <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/75 backdrop-blur-sm p-0 sm:p-4">
@@ -141,47 +149,29 @@ export function CostDrawer({
             <span>Disciplined Model Routing Strategy</span>
           </div>
           <div className="grid grid-cols-1 gap-1.5 text-[11px] text-zinc-300">
-            <div className="flex items-start justify-between gap-2 rounded-lg bg-zinc-900/90 p-2 border border-zinc-800/70">
-              <div>
-                <span className="font-mono font-semibold text-emerald-400">
-                  Tier 1: gemini-2.5-flash-lite
+            {routing.map((t) => (
+              <div
+                key={t.tier}
+                className="flex items-start justify-between gap-2 rounded-lg bg-zinc-900/90 p-2 border border-zinc-800/70"
+              >
+                <div className="min-w-0">
+                  <span className={`font-mono font-semibold ${TIER_COLOR[t.tier] || "text-zinc-200"}`}>
+                    Tier {t.tier}: {t.model}
+                  </span>
+                  <p className="text-zinc-400 mt-0.5">{t.purpose}</p>
+                  {t.fallbacks.length > 0 && (
+                    <p className="text-[10px] font-mono text-zinc-500 mt-0.5 break-words">
+                      Fallbacks: {t.fallbacks.join(" → ")}
+                    </p>
+                  )}
+                </div>
+                <span className="font-mono text-[10px] text-zinc-400 shrink-0 text-right">
+                  ${t.price_per_1m[0].toFixed(2)} in
+                  <br />${t.price_per_1m[1].toFixed(2)} out
+                  <br />/ 1M tok
                 </span>
-                <p className="text-zinc-400 mt-0.5">
-                  Batch-triages 15 NSE/BSE filings per call into 17 categories + 1-line digest.
-                </p>
               </div>
-              <span className="font-mono text-[10px] text-zinc-400 shrink-0">
-                $0.10 / 1M
-              </span>
-            </div>
-
-            <div className="flex items-start justify-between gap-2 rounded-lg bg-zinc-900/90 p-2 border border-zinc-800/70">
-              <div>
-                <span className="font-mono font-semibold text-cyan-400">
-                  Tier 2: gemini-2.5-flash
-                </span>
-                <p className="text-zinc-400 mt-0.5">
-                  Extracts QoQ/YoY P&amp;L tables, exec bios, Concall Map notes &amp; Copilot Q&amp;A.
-                </p>
-              </div>
-              <span className="font-mono text-[10px] text-zinc-400 shrink-0">
-                $0.30 / 1M
-              </span>
-            </div>
-
-            <div className="flex items-start justify-between gap-2 rounded-lg bg-zinc-900/90 p-2 border border-zinc-800/70">
-              <div>
-                <span className="font-mono font-semibold text-purple-400">
-                  Tier 3: gemini-2.5-pro
-                </span>
-                <p className="text-zinc-400 mt-0.5">
-                  Reserved strictly for 8-module Pull synthesis &amp; 4-Quarter Narrative vs Numbers audit.
-                </p>
-              </div>
-              <span className="font-mono text-[10px] text-zinc-400 shrink-0">
-                $1.25 / 1M
-              </span>
-            </div>
+            ))}
           </div>
         </div>
 

@@ -1,4 +1,5 @@
 """Offline checks: no network, no LLM calls, never writes finn.db. Run with: python backend/test_offline.py"""
+import logging
 import os
 import sqlite3
 import sys
@@ -12,7 +13,11 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
-from backend import main
+from types import SimpleNamespace
+
+from google.genai import errors as genai_errors
+
+from backend import llm_router, main
 from backend.db import DB_PATH, SEED_PORTFOLIO, init_db, normalize_ticker
 from backend.scrapers.filings import enforce_filing_hygiene
 
@@ -199,6 +204,94 @@ def test_paid_endpoints_are_guarded() -> None:
         r = client.get("/api/pull/TRENT")  # cached report costs $0, so it is served even with no budget
         assert r.status_code == 200 and r.json()["cached"] is True, r.status_code
     main._rate_hits.clear()
+
+
+def test_llm_cost_includes_thinking_tokens() -> None:
+    # gemini-3.1-pro-preview: $2.00 in / $12.00 out per 1M; thinking tokens are billed at the output rate.
+    cost = llm_router.llm_cost_usd("gemini-3.1-pro-preview", tokens_in=10_000, tokens_out=2_000, tokens_thinking=500)
+    assert abs(cost - (10_000 * 2.00 + 2_500 * 12.00) / 1e6) < 1e-9, cost  # $0.05
+    assert llm_router.llm_cost_usd("gemini-3.1-flash-lite", 1_000_000, 1_000_000) == 1.75
+    # Unknown model -> priced at the most expensive known rates, never the cheap default
+    top_in = max(p[0] for p in llm_router.MODEL_PRICING_PER_1M.values())
+    top_out = max(p[1] for p in llm_router.MODEL_PRICING_PER_1M.values())
+    assert llm_router.llm_cost_usd("gemini-unknown", 1_000_000, 1_000_000) == top_in + top_out
+    for model, (pin, pout) in llm_router.MODEL_PRICING_PER_1M.items():
+        assert 0 < pin < pout, f"suspicious pricing for {model}"
+
+
+def test_fallback_order() -> None:
+    fb = llm_router.MODEL_FALLBACKS
+    pro_chain = fb[llm_router.MODEL_PRO]
+    assert pro_chain[0] == llm_router.MODEL_PRO == "gemini-3.1-pro-preview"
+    assert pro_chain[-1] == llm_router.MODEL_FLASH, "Flash must be the last resort for Pull synthesis"
+    assert not any("flash" in m for m in pro_chain[:-1]), f"a Flash model is ahead of a Pro model: {pro_chain}"
+    for primary, chain in fb.items():
+        assert chain[0] == primary, f"{primary} chain doesn't start with itself"
+        assert len(set(chain)) == len(chain), f"duplicate in {chain}"
+        assert all(m in llm_router.MODEL_PRICING_PER_1M for m in chain), f"unpriced model in {chain}"
+    # Thinking config per family, as verified by the probe
+    assert llm_router._thinking_config("gemini-2.5-flash").thinking_budget == 0
+    assert llm_router._thinking_config("gemini-2.5-pro").thinking_budget == 512
+    assert llm_router._thinking_config("gemini-4-argon").thinking_budget is None  # budget -> 400 on argon
+    assert llm_router._thinking_config("gemini-3.1-pro-preview").thinking_level is not None
+
+
+class _FakeModels:
+    """generate_content stand-in: raises the scripted error for a model, otherwise returns a JSON response."""
+
+    def __init__(self, failures: dict[str, Exception]):
+        self.failures, self.calls = failures, []
+
+    def generate_content(self, model, contents, config):
+        self.calls.append(model)
+        if model in self.failures:
+            raise self.failures[model]
+        usage = SimpleNamespace(prompt_token_count=100, candidates_token_count=20, thoughts_token_count=30)
+        return SimpleNamespace(text='{"ok": true}', usage_metadata=usage)
+
+
+def _api_error(code: int) -> genai_errors.APIError:
+    return genai_errors.ClientError(code, {"error": {"code": code, "message": f"fake {code}", "status": "X"}})
+
+
+def test_fallback_walks_pro_chain_and_logs() -> None:
+    orig_client = llm_router._get_client
+    llm_router._UNAVAILABLE_MODELS.clear()
+    try:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            db = Path(tmp) / "ledger.db"
+            init_db(db)
+            fake = _FakeModels({"gemini-3.1-pro-preview": _api_error(404), "gemini-4-argon": _api_error(429)})
+            llm_router._get_client = lambda: SimpleNamespace(models=fake)
+            warnings: list[str] = []
+            handler = logging.Handler()
+            handler.emit = lambda record: warnings.append(record.getMessage())
+            llm_router.logger.addHandler(handler)
+            try:
+                data, served = llm_router.call_gemini_pro_json("p", ticker="TEST", db_path=db)
+            finally:
+                llm_router.logger.removeHandler(handler)
+            assert data == {"ok": True} and served == "gemini-2.5-pro", served
+            assert fake.calls == ["gemini-3.1-pro-preview", "gemini-4-argon", "gemini-2.5-pro"], fake.calls
+            assert len(warnings) == 2 and "falling back to gemini-4-argon" in warnings[0], warnings
+            assert "gemini-3.1-pro-preview" in llm_router._UNAVAILABLE_MODELS  # 404 is remembered, 429 is not
+            assert "gemini-4-argon" not in llm_router._UNAVAILABLE_MODELS
+            conn = sqlite3.connect(db)
+            row = conn.execute("SELECT model, tokens_in, tokens_out, cost_usd FROM llm_cost_ledger").fetchone()
+            conn.close()
+            assert row == ("gemini-2.5-pro", 100, 50, round((100 * 1.25 + 50 * 10.0) / 1e6, 6)), row
+
+            # Auth errors hit every model alike: no fallback, error propagates
+            fake2 = _FakeModels({llm_router.MODEL_FLASH: _api_error(401)})
+            llm_router._get_client = lambda: SimpleNamespace(models=fake2)
+            try:
+                llm_router._call_gemini_json("p", model=llm_router.MODEL_FLASH, workflow="t", db_path=db)
+                raise AssertionError("401 should not fall back")
+            except genai_errors.APIError as exc:
+                assert exc.code == 401 and fake2.calls == [llm_router.MODEL_FLASH], fake2.calls
+    finally:
+        llm_router._get_client = orig_client
+        llm_router._UNAVAILABLE_MODELS.clear()
 
 
 if __name__ == "__main__":

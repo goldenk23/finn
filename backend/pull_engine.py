@@ -10,7 +10,7 @@ from backend.pdf_utils import extract_pdf_text
 from backend.scrapers.screener import fetch_screener_fundamentals
 from backend.scrapers.filings import fetch_company_filings
 from backend.llm_router import (
-    _call_gemini_json,
+    _call_gemini_json_with_model,
     call_gemini_pro_json,
     MODEL_FLASH,
 )
@@ -211,6 +211,7 @@ def get_or_generate_pull_report(
 
         # 4. Map Step (Tier 2: gemini-2.5-flash): Distill management promises & commentary per document
         distilled_notes: list[dict[str, Any]] = []
+        map_model: str | None = None  # stays None if there were no PDFs or the map step failed
         if primary_docs:
             docs_payload = [
                 {
@@ -236,7 +237,7 @@ Primary Documents:
 {json.dumps(docs_payload, ensure_ascii=False)}
 """
             try:
-                mapped = _call_gemini_json(
+                mapped, map_model = _call_gemini_json_with_model(
                     prompt=map_prompt,
                     model=MODEL_FLASH,
                     workflow="pull_concall_map",
@@ -378,12 +379,13 @@ Note on `quarters_audit`: MUST include 4 entries corresponding to the last 4 rep
 Primary Source Bundle:
 {json.dumps(primary_bundle, ensure_ascii=False)}
 """
-        report = call_gemini_pro_json(
+        report, reduce_model = call_gemini_pro_json(
             prompt=reduce_prompt,
             workflow="pull_deep_synthesis",
             ticker=clean_ticker,
             db_path=db_path,
         )
+        report["models_used"] = {"map": map_model, "reduce": reduce_model}
 
         # Attach source provenance metadata to report
         report["sources_used"] = {
@@ -815,7 +817,7 @@ Return a JSON object with:
 Primary Data Context:
 {json.dumps(context, ensure_ascii=False)[:40000]}
 """
-    res = _call_gemini_json(
+    res, served_by = _call_gemini_json_with_model(
         prompt=prompt,
         model=MODEL_FLASH,
         workflow="pull_copilot_qa",
@@ -836,4 +838,5 @@ Primary Data Context:
         "answer": answer_text,
         "citations": [c["label"] for c in citation_links],
         "citation_links": citation_links,
+        "model": served_by,
     }

@@ -2,7 +2,6 @@ import hmac
 import json
 import logging
 import os
-import re
 import threading
 import time
 from collections import defaultdict, deque
@@ -14,15 +13,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from backend.llm_router import _sanitize_log_message  # shared with the LLM fallback warnings
+
 logger = logging.getLogger("finn.api")
-
-
-def _sanitize_log_message(msg: str) -> str:
-    """Strip any potential API key or bearer token substrings before logging."""
-    s = re.sub(r"(key|token|access_token|secret)=[^&\s\"']+", r"\1=[REDACTED]", msg, flags=re.IGNORECASE)
-    s = re.sub(r"Bearer\s+[0-9A-Za-z\-._~+/]+=*", "Bearer [REDACTED]", s, flags=re.IGNORECASE)
-    s = re.sub(r"(AIza|AQ\.|ya29\.)[0-9A-Za-z\-_]{16,}", "[REDACTED_KEY]", s)
-    return s
 
 
 def _friendly_upstream_error(context: str, exc: Exception) -> HTTPException:

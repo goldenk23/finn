@@ -1,9 +1,12 @@
 import json
+import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 from dotenv import load_dotenv
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 from ddgs import DDGS
 
@@ -15,24 +18,74 @@ from backend.scrapers.filings import enforce_filing_hygiene
 # Load .env from project root
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-MODEL_FLASH_LITE = "gemini-2.5-flash-lite"
-MODEL_FLASH = "gemini-2.5-flash"
-MODEL_PRO = "gemini-2.5-pro"
+logger = logging.getLogger("finn.llm")
 
-# Pricing per 1M tokens (USD) for cost ledger tracking
+
+def _sanitize_log_message(msg: str) -> str:
+    """Strip any potential API key or bearer token substrings before logging."""
+    s = re.sub(r"(key|token|access_token|secret)=[^&\s\"']+", r"\1=[REDACTED]", msg, flags=re.IGNORECASE)
+    s = re.sub(r"Bearer\s+[0-9A-Za-z\-._~+/]+=*", "Bearer [REDACTED]", s, flags=re.IGNORECASE)
+    s = re.sub(r"(AIza|AQ\.|ya29\.)[0-9A-Za-z\-_]{16,}", "[REDACTED_KEY]", s)
+    return s
+
+
+# Model routing, verified by a live probe on 2026-10-31 (Vertex AI, location=global).
+# gemini-2.5-flash-lite and gemini-2.5-pro return 404 for this project (global and us-central1), which is why
+# triage silently ran on 2.5-flash and Pull synthesis dropped to 2.5-flash.
+MODEL_FLASH_LITE = "gemini-3.1-flash-lite"  # Tier 1: filing triage (cheapest working Lite)
+MODEL_FLASH = "gemini-2.5-flash"  # Tier 2: PDF extraction, exec bios, concall map, Copilot
+MODEL_PRO = "gemini-3.1-pro-preview"  # Tier 3: Pull 8-module synthesis
+
+# USD per 1M tokens: Standard paid tier, text input, prompts <= 200k tokens. Output price includes thinking tokens.
+# Source: https://ai.google.dev/gemini-api/docs/pricing (Vertex global rates match:
+# https://cloud.google.com/vertex-ai/generative-ai/pricing), checked 2026-10-31.
+# ponytail: ignores the >200k-token long-context rates of the Pro models (our prompts are capped far below) and the
+# scheduled increases (gemini-4-argon -> $4/$20 on 2026-12-01; 3.6/3.8 Flash -> $1.50/$7.50 on 2027-01-01).
 MODEL_PRICING_PER_1M: dict[str, tuple[float, float]] = {
-    MODEL_FLASH_LITE: (0.10, 0.40),
-    MODEL_FLASH: (0.30, 2.50),
-    "gemini-3-flash-preview": (0.30, 2.50),
-    MODEL_PRO: (1.25, 10.00),
-    "gemini-3.1-pro-preview": (1.25, 10.00),
+    "gemini-2.5-flash-lite": (0.10, 0.40),
+    "gemini-3.1-flash-lite": (0.25, 1.50),
+    "gemini-3.5-flash-lite": (0.30, 2.50),
+    "gemini-2.5-flash": (0.30, 2.50),
+    "gemini-3-flash-preview": (0.50, 3.00),
+    "gemini-3.8-flash": (0.75, 3.75),
+    "gemini-2.5-pro": (1.25, 10.00),
+    "gemini-3.1-pro-preview": (2.00, 12.00),
+    "gemini-4-argon": (2.00, 10.00),
 }
 
+# Tried in order. Pull synthesis only drops to Flash once every Pro-class model has failed.
 MODEL_FALLBACKS: dict[str, list[str]] = {
-    MODEL_FLASH_LITE: [MODEL_FLASH_LITE, MODEL_FLASH, "gemini-3-flash-preview"],
-    MODEL_FLASH: [MODEL_FLASH, "gemini-3-flash-preview"],
-    MODEL_PRO: [MODEL_PRO, MODEL_FLASH, "gemini-3-flash-preview", "gemini-3.1-pro-preview"],
+    MODEL_FLASH_LITE: [MODEL_FLASH_LITE, "gemini-3.5-flash-lite", "gemini-2.5-flash-lite", MODEL_FLASH],
+    MODEL_FLASH: [MODEL_FLASH, "gemini-3.8-flash", "gemini-3-flash-preview"],
+    MODEL_PRO: [MODEL_PRO, "gemini-4-argon", "gemini-2.5-pro", MODEL_FLASH],
 }
+
+ROUTING_TIERS = [
+    {"tier": 1, "model": MODEL_FLASH_LITE, "purpose": "Batch-triages 15 NSE/BSE filings per call into 17 categories + 1-line digest."},
+    {"tier": 2, "model": MODEL_FLASH, "purpose": "Results PDF tables, exec bios, Concall Map notes and Copilot Q&A."},
+    {"tier": 3, "model": MODEL_PRO, "purpose": "8-module Pull synthesis and the 4-quarter Narrative vs Numbers audit."},
+]
+
+
+def _thinking_config(model: str) -> types.ThinkingConfig:
+    """Per-family thinking settings, from the probe:
+    - Gemini 2.x accepts only thinking_budget (thinking_level -> 400). 2.5 Pro can't turn thinking off (min 128).
+    - gemini-4-argon accepts only thinking_level (any thinking_budget -> 400).
+    - Gemini 3.x accepts both; thinking_budget=0 turns thinking off (0 thought tokens) on the Flash/Lite models.
+    """
+    if model.startswith("gemini-2."):
+        return types.ThinkingConfig(thinking_budget=512 if "pro" in model else 0)
+    if "pro" in model or model.startswith("gemini-4"):
+        return types.ThinkingConfig(thinking_level="LOW")  # bounded reasoning for synthesis
+    return types.ThinkingConfig(thinking_budget=0)
+
+
+def llm_cost_usd(model: str, tokens_in: int, tokens_out: int, tokens_thinking: int = 0) -> float:
+    # Unknown models are priced at the most expensive known rates so the budget cap never undercounts.
+    in_rate, out_rate = MODEL_PRICING_PER_1M.get(
+        model, (max(p[0] for p in MODEL_PRICING_PER_1M.values()), max(p[1] for p in MODEL_PRICING_PER_1M.values()))
+    )
+    return round((tokens_in * in_rate + (tokens_out + tokens_thinking) * out_rate) / 1_000_000.0, 6)
 
 # Cache models that return 404 NOT_FOUND in the active GCP project to avoid repeated 404 roundtrips
 _UNAVAILABLE_MODELS: set[str] = set()
@@ -95,16 +148,17 @@ def log_llm_usage(
     tokens_out: int,
     ticker: str | None = None,
     db_path: Path = DB_PATH,
+    tokens_thinking: int = 0,
 ) -> float:
-    in_rate, out_rate = MODEL_PRICING_PER_1M.get(model, (0.30, 2.50))
-    cost_usd = round((tokens_in * in_rate + tokens_out * out_rate) / 1_000_000.0, 6)
+    cost_usd = llm_cost_usd(model, tokens_in, tokens_out, tokens_thinking)
     with get_conn(db_path) as conn:
         conn.execute(
             """
             INSERT INTO llm_cost_ledger (workflow, ticker, model, tokens_in, tokens_out, cost_usd)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (workflow, ticker, model, tokens_in, tokens_out, cost_usd),
+            # tokens_out is billed output: response + thinking tokens
+            (workflow, ticker, model, tokens_in, tokens_out + tokens_thinking, cost_usd),
         )
     return cost_usd
 
@@ -134,64 +188,93 @@ def get_cost_summary(db_path: Path = DB_PATH) -> dict[str, Any]:
     return {
         "totals": dict(totals) if totals else {},
         "by_workflow": [dict(r) for r in rows],
+        "routing": [
+            {**t, "fallbacks": MODEL_FALLBACKS[t["model"]][1:], "price_per_1m": MODEL_PRICING_PER_1M[t["model"]]}
+            for t in ROUTING_TIERS
+        ],
     }
 
 
-def _call_gemini_json(
+def latest_model_for(workflow: str, db_path: Path = DB_PATH) -> str | None:
+    """Model that served the most recent call of a workflow, per the ledger."""
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT model FROM llm_cost_ledger WHERE workflow = ? ORDER BY id DESC LIMIT 1", (workflow,)
+        ).fetchone()
+    return row["model"] if row else None
+
+
+def _is_model_fallback_error(exc: Exception) -> bool:
+    """Errors specific to one model (not found, unsupported config, quota, overload, bad JSON) -> try the next model.
+    Auth failures and network errors would hit every model the same way, so they propagate."""
+    if isinstance(exc, json.JSONDecodeError):
+        return True
+    return isinstance(exc, genai_errors.APIError) and exc.code not in (401, 403)
+
+
+def _call_gemini_json_with_model(
     prompt: str,
     model: str,
     workflow: str,
     ticker: str | None = None,
     temperature: float = 0.1,
     db_path: Path = DB_PATH,
-) -> Any:
+) -> tuple[Any, str]:
+    """Returns (parsed JSON, model that actually served it), walking MODEL_FALLBACKS[model] on model-specific errors."""
     client = _get_client()
     raw_candidates = MODEL_FALLBACKS.get(model, [model])
     candidates = [m for m in raw_candidates if m not in _UNAVAILABLE_MODELS] or raw_candidates
     last_err: Exception | None = None
 
-    for candidate_model in candidates:
+    for i, candidate_model in enumerate(candidates):
         try:
-            tb = 512 if "pro" in candidate_model else 0
             resp = client.models.generate_content(
                 model=candidate_model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     temperature=temperature,
                     response_mime_type="application/json",
-                    thinking_config=types.ThinkingConfig(thinking_budget=tb),
+                    thinking_config=_thinking_config(candidate_model),
                 ),
             )
             usage = resp.usage_metadata
-            tokens_in = int(getattr(usage, "prompt_token_count", 0) or 0)
-            tokens_out = int(getattr(usage, "candidates_token_count", 0) or 0)
             log_llm_usage(
                 workflow=workflow,
                 model=candidate_model,
-                tokens_in=tokens_in,
-                tokens_out=tokens_out,
+                tokens_in=int(getattr(usage, "prompt_token_count", 0) or 0),
+                tokens_out=int(getattr(usage, "candidates_token_count", 0) or 0),
+                tokens_thinking=int(getattr(usage, "thoughts_token_count", 0) or 0),
                 ticker=ticker,
                 db_path=db_path,
             )
-            raw_text = (resp.text or "{}").strip()
-            return json.loads(raw_text)
+            return json.loads((resp.text or "{}").strip()), candidate_model
         except Exception as exc:
+            if not _is_model_fallback_error(exc):
+                raise
             last_err = exc
-            err_str = str(exc)
-            if "404" in err_str or "NOT_FOUND" in err_str:
+            if isinstance(exc, genai_errors.APIError) and exc.code == 404:
                 _UNAVAILABLE_MODELS.add(candidate_model)
-                continue
-            if isinstance(exc, json.JSONDecodeError):
-                continue
-            raise
-    raise RuntimeError(f"All candidate models {raw_candidates} failed: {last_err}")
+            nxt = candidates[i + 1] if i + 1 < len(candidates) else None
+            logger.warning(
+                "[llm] %s (%s): %s failed, %s. Reason: %s",
+                workflow,
+                ticker or "-",
+                candidate_model,
+                f"falling back to {nxt}" if nxt else "no fallbacks left",
+                _sanitize_log_message(" ".join(f"{type(exc).__name__}: {exc}".split()))[:300],
+            )
+    raise RuntimeError(f"All candidate models {candidates} failed: {last_err}")
+
+
+def _call_gemini_json(*args: Any, **kwargs: Any) -> Any:
+    return _call_gemini_json_with_model(*args, **kwargs)[0]
 
 
 def classify_and_summarize_batch(
     filings: list[dict[str, Any]], db_path: Path = DB_PATH, batch_size: int = 15
 ) -> dict[str, dict[str, Any]]:
     """
-    Tier 1 (gemini-2.5-flash-lite):
+    Tier 1 (MODEL_FLASH_LITE):
     Batch-classifies corporate announcements into the 17 categories, assigns materiality (0 or 1),
     and generates a sharp 1-line investor summary.
     """
@@ -401,7 +484,7 @@ def enrich_quarterly_results(
     db_path: Path = DB_PATH,
 ) -> dict[str, Any]:
     """
-    Tier 2 (gemini-2.5-flash):
+    Tier 2 (MODEL_FLASH):
     Extracts Revenue, EBITDA, PBT, and PAT with QoQ and YoY % changes.
     Cross-checks PDF extraction against Screener's normalized ₹ Cr quarterly table
     to prevent PDF unit-conversion anomalies (Million/Billion vs Crore), and formats all % deltas consistently.
@@ -453,7 +536,7 @@ Filing PDF Text:
 {pdf_text[:30000]}
 """
         try:
-            res = _call_gemini_json(
+            res, served_by = _call_gemini_json_with_model(
                 prompt=prompt_pdf,
                 model=MODEL_FLASH,
                 workflow="push_enrich_results_pdf",
@@ -462,6 +545,7 @@ Filing PDF Text:
             )
             if isinstance(res, dict) and res.get("has_numbers") is True and _is_pdf_extraction_sane(res, sc_ref):
                 res["source"] = "Exchange Filing PDF"
+                res["model"] = served_by
                 return _normalize_results_enrichment(res)
         except Exception as exc:
             print(f"[llm_router] PDF results extraction failed for {ticker}, using Screener table: {exc}")
@@ -473,8 +557,9 @@ Filing PDF Text:
 Metrics: {json.dumps(sc_ref['metrics'], ensure_ascii=False)}
 Return JSON: {{"takeaway": "1 concise sentence highlighting Revenue & PAT QoQ/YoY growth and operating margin direction."}}"""
     takeaway = f"{ticker} reported {sc_ref['period']} Revenue of ₹{sc_ref['metrics']['revenue']['value']} Cr ({sc_ref['metrics']['revenue']['qoq_pct']} QoQ, {sc_ref['metrics']['revenue']['yoy_pct']} YoY) and PAT of ₹{sc_ref['metrics']['pat']['value']} Cr ({sc_ref['metrics']['pat']['qoq_pct']} QoQ, {sc_ref['metrics']['pat']['yoy_pct']} YoY)."
+    takeaway_model: str | None = None  # None = numbers and takeaway are deterministic, no LLM involved
     try:
-        t_res = _call_gemini_json(
+        t_res, served_by = _call_gemini_json_with_model(
             prompt=prompt_takeaway,
             model=MODEL_FLASH,
             workflow="push_enrich_results_fallback",
@@ -483,8 +568,9 @@ Return JSON: {{"takeaway": "1 concise sentence highlighting Revenue & PAT QoQ/Yo
         )
         if isinstance(t_res, dict) and t_res.get("takeaway"):
             takeaway = t_res["takeaway"].strip()
-    except Exception:
-        pass
+            takeaway_model = served_by
+    except Exception as exc:
+        logger.warning("[llm] results takeaway for %s fell back to template: %s", ticker, _sanitize_log_message(str(exc))[:200])
 
     return _normalize_results_enrichment(
         {
@@ -494,6 +580,7 @@ Return JSON: {{"takeaway": "1 concise sentence highlighting Revenue & PAT QoQ/Yo
             "source": sc_ref["source"],
             "metrics": sc_ref["metrics"],
             "takeaway": takeaway,
+            "model": takeaway_model,
         }
     )
 
@@ -526,7 +613,7 @@ def enrich_management_change(
     db_path: Path = DB_PATH,
 ) -> dict[str, Any]:
     """
-    Tier 2 (gemini-2.5-flash) + DuckDuckGo Search (ddgs):
+    Tier 2 (MODEL_FLASH) + DuckDuckGo Search (ddgs):
     1. Extracts person name, role, and change type from the filing PDF (first 4 pages) + title.
     2. Runs a DuckDuckGo search for the executive's prior background / LinkedIn.
     3. Synthesizes a grounded 2-line bio without hallucinating.
@@ -579,7 +666,7 @@ Return a JSON object with:
 - "two_line_bio": A sharp 2-line background/bio covering who they are, where they came from (previous companies/roles/education), or the context of their departure.
 - "source_url": Best reference URL from the search snippets (e.g. LinkedIn or profile page), or "" if only from the exchange filing.
 """
-    enriched = _call_gemini_json(
+    enriched, served_by = _call_gemini_json_with_model(
         prompt=bio_prompt,
         model=MODEL_FLASH,
         workflow="push_mgmt_bio",
@@ -588,7 +675,7 @@ Return a JSON object with:
     )
     if isinstance(enriched, list):
         enriched = enriched[0] if enriched and isinstance(enriched[0], dict) else {}
-    return enriched if isinstance(enriched, dict) else {}
+    return {**enriched, "model": served_by} if isinstance(enriched, dict) else {}
 
 
 def call_gemini_pro_json(
@@ -596,11 +683,12 @@ def call_gemini_pro_json(
     workflow: str = "pull_deep_synthesis",
     ticker: str | None = None,
     db_path: Path = DB_PATH,
-) -> Any:
+) -> tuple[Any, str]:
     """
-    Tier 3 (gemini-2.5-pro): Reserved for complex Pull multi-quarter reasoning ('Numbers vs. Narrative').
+    Tier 3 (MODEL_PRO): Reserved for complex Pull multi-quarter reasoning ('Numbers vs. Narrative').
+    Returns (report JSON, model that served it).
     """
-    return _call_gemini_json(
+    return _call_gemini_json_with_model(
         prompt=prompt,
         model=MODEL_PRO,
         workflow=workflow,

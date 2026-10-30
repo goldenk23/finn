@@ -341,6 +341,7 @@ export default function FinnAppPage() {
               cachedReports={cachedReports}
               onSelectTicker={loadPullReport}
               onCostUpdated={loadTelemetryAndCache}
+              routing={costData?.routing}
             />
           )}
 

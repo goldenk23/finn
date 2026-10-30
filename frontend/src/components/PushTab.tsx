@@ -136,8 +136,11 @@ export function PushTab({
             <div>
               <div className="text-xs font-bold text-white flex items-center gap-1.5">
                 <span>{stats.noise_filtered_pct}% Exchange Noise Buried</span>
-                <span className="text-[10px] font-mono font-normal text-emerald-400 bg-emerald-500/10 px-1.5 py-0.5 rounded">
-                  Flash-Lite Triage
+                <span
+                  className="text-[10px] font-mono font-normal text-emerald-400 bg-emerald-500/10 px-1.5 py-0.5 rounded"
+                  title="Model that served the latest triage batch"
+                >
+                  {stats.triage_model ? `${stats.triage_model} triage` : "Rule-based triage"}
                 </span>
               </div>
               <p className="text-[11px] text-zinc-400 mt-0.5">

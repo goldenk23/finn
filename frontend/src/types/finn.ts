@@ -53,6 +53,8 @@ export interface DigestResponse {
     material_count: number;
     routine_collapsed_count: number;
     noise_filtered_pct: number;
+    /** Model that served the latest LLM triage batch; null if only the regex classifier has run. */
+    triage_model?: string | null;
   };
   material: FilingItem[];
   routine: FilingItem[];
@@ -179,6 +181,8 @@ export interface PullReport {
     bull_case: string[];
     bear_case: string[];
   };
+  /** Models that actually served the Map and Reduce steps (map is null when no PDFs were mapped). */
+  models_used?: { map: string | null; reduce: string };
   sources_used?: {
     screener_url?: string;
     documents_parsed?: { period: string; doc_type: string; url: string }[];
@@ -234,6 +238,7 @@ export interface CopilotQAResponse {
   answer: string;
   citations: string[];
   citation_links?: CopilotCitationLink[];
+  model?: string;
 }
 
 export interface CostWorkflowRow {
@@ -253,5 +258,15 @@ export interface CostSummaryResponse {
     cost_usd: number;
   };
   by_workflow: CostWorkflowRow[];
+  routing?: RoutingTier[];
+}
+
+export interface RoutingTier {
+  tier: 1 | 2 | 3;
+  model: string;
+  purpose: string;
+  fallbacks: string[];
+  /** [input, output] USD per 1M tokens; output includes thinking tokens. */
+  price_per_1m: [number, number];
 }
 
