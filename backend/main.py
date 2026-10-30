@@ -228,8 +228,14 @@ class AddPortfolioTickerRequest(BaseModel):
     cap_tier: str = "Listed"
 
 
+class CopilotTurn(BaseModel):
+    question: str = Field(..., max_length=1000)
+    answer: str = Field(..., max_length=4000)
+
+
 class AskCopilotRequest(BaseModel):
     question: str = Field(..., max_length=1000)
+    history: list[CopilotTurn] = Field(default_factory=list, max_length=2)  # last 2 Q&A turns, oldest first
 
 
 @app.get("/api/health")
@@ -441,7 +447,9 @@ def api_ask_pull_copilot(ticker: str, req: AskCopilotRequest, request: Request) 
         _guard_paid_call(request, "pull")  # asking about an uncached ticker builds a full report first
     _guard_paid_call(request, "ask")
     try:
-        return ask_pull_copilot(ticker=ticker, question=req.question.strip())
+        return ask_pull_copilot(
+            ticker=ticker, question=req.question.strip(), history=[t.model_dump() for t in req.history]
+        )
     except HTTPException:
         raise
     except Exception as exc:

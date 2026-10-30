@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 import json
 import re
 import threading
@@ -36,6 +37,35 @@ CONCALL_KEYWORDS = [
     "target",
 ]
 
+# Annual Report sections Pull must read. A page scores one point per distinct phrase it contains,
+# so each section gets a few specific phrases and no single section hogs every page slot.
+AR_KEYWORDS = [
+    # MD&A
+    "management discussion",
+    "industry structure",
+    "opportunities and threats",
+    # Segment performance
+    "segment revenue",
+    "segment results",
+    "operating segment",
+    # Contingent liabilities
+    "contingent liabilit",
+    "not acknowledged as debt",
+    # Related party transactions
+    "related party",
+    "key managerial personnel",
+    # Auditor's report
+    "independent auditor",
+    "key audit matter",
+    "basis for opinion",
+]
+# ponytail: one keyword-scored pass over the whole AR, not per-section selection. A section whose pages
+# never use these phrases can be missed; upgrade path is one extract_pdf_text pass per section.
+AR_MAX_PAGES = 13  # extract_pdf_text always keeps 3 cover pages, leaving 10 keyword pages
+AR_MAX_CHARS_PER_PAGE = 3000
+AR_MAX_CHARS = 40000  # hard ceiling, ~10k input tokens to the Flash map step
+CONCALL_EXCERPT_CHARS = 12000
+
 
 def _get_ticker_lock(ticker: str) -> threading.Lock:
     with _LOCKS_GUARD:
@@ -46,10 +76,11 @@ def _get_ticker_lock(ticker: str) -> threading.Lock:
 
 def _extract_primary_documents(screener_data: dict[str, Any], max_concalls: int = 4) -> list[dict[str, str]]:
     """
-    Download and extract high-signal pages in parallel from the last up to 4 Concall Transcripts / Investor PPTs,
-    falling back to the latest Annual Report if concall PDFs are unavailable.
+    Download and extract high-signal pages in parallel from the last up to 4 Concall Transcripts / Investor PPTs
+    plus the latest Annual Report (MD&A, segments, contingent liabilities, related parties, auditor's report).
     """
     concalls = (screener_data.get("concalls") or [])[:max_concalls]
+    annual_reports = screener_data.get("annual_reports") or []
 
     def _fetch_one(cc: dict[str, str]) -> dict[str, str] | None:
         period = cc.get("period", "Recent Quarter")
@@ -62,34 +93,33 @@ def _extract_primary_documents(screener_data: dict[str, Any], max_concalls: int 
             return {"period": period, "doc_type": doc_type, "url": url, "text": text}
         return None
 
-    docs: list[dict[str, str]] = []
-    if concalls:
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            for item in pool.map(_fetch_one, concalls):
-                if item:
-                    docs.append(item)
-
-    # Supplement with latest Annual Report MD&A if fewer than 2 concall docs extracted
-    annual_reports = screener_data.get("annual_reports") or []
-    if len(docs) < 2 and annual_reports:
-        ar = annual_reports[0]
+    def _fetch_annual_report(ar: dict[str, str]) -> dict[str, str] | None:
         ar_url = ar.get("url", "")
-        if ar_url:
-            ar_text = extract_pdf_text(
-                ar_url,
-                max_pages=10,
-                keywords=["management discussion", "outlook", "segment", "performance", "strategy", "risk", "capex"],
-                max_chars=16000,
-            )
-            if len(ar_text.strip()) > 400:
-                docs.append(
-                    {
-                        "period": ar.get("title", "Latest Annual Report"),
-                        "doc_type": "Annual Report",
-                        "url": ar_url,
-                        "text": ar_text,
-                    }
-                )
+        if not ar_url:
+            return None
+        ar_text = extract_pdf_text(
+            ar_url,
+            max_pages=AR_MAX_PAGES,
+            keywords=AR_KEYWORDS,
+            max_chars=AR_MAX_CHARS,
+            max_chars_per_page=AR_MAX_CHARS_PER_PAGE,
+        )
+        if len(ar_text.strip()) > 400:
+            return {
+                "period": ar.get("title", "Latest Annual Report"),
+                "doc_type": "Annual Report",
+                "url": ar_url,
+                "text": ar_text,
+            }
+        return None
+
+    # Always read the latest Annual Report alongside the concalls (Screener lists newest first)
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        ar_future = pool.submit(_fetch_annual_report, annual_reports[0]) if annual_reports else None
+        docs = [item for item in pool.map(_fetch_one, concalls) if item]
+        ar_doc = ar_future.result() if ar_future else None
+    if ar_doc:
+        docs.append(ar_doc)
 
     return docs
 
@@ -159,6 +189,27 @@ def _get_ledger_snapshot(ticker: str, db_path: Path = DB_PATH) -> tuple[int, int
     return int(row["tin"]), int(row["tout"]), float(row["cost"])
 
 
+def _quarters_without_prior_call(quarter_headers: list[str], concalls: list[dict[str, str]]) -> list[str]:
+    """
+    Quarter headers (e.g. 'Sep 2025') with no concall/PPT dated in that quarter's 3 months. A call in those months
+    discusses the previous quarter's results, so it is the latest guidance management gave before this quarter's.
+    """
+    def _month_index(label: str) -> int | None:
+        try:
+            d = datetime.strptime(str(label).strip()[:8], "%b %Y")
+        except ValueError:
+            return None
+        return d.year * 12 + d.month
+
+    call_months = {m for m in (_month_index(c.get("period", "")) for c in concalls) if m is not None}
+    out = []
+    for q in quarter_headers:
+        end = _month_index(q)
+        if end is not None and not any(end - 2 <= m <= end for m in call_months):
+            out.append(q)
+    return out
+
+
 def get_or_generate_pull_report(
     ticker: str,
     force_refresh: bool = False,
@@ -183,6 +234,8 @@ def get_or_generate_pull_report(
                     (clean_ticker,),
                 ).fetchone()
             if cached:
+                report = json.loads(cached["report_json"])
+                report.setdefault("document_notes", [])  # reports cached before notes were persisted
                 return {
                     "ticker": clean_ticker,
                     "quarter_key": cached["quarter_key"],
@@ -192,7 +245,7 @@ def get_or_generate_pull_report(
                     "cost_usd": cached["cost_usd"],
                     "created_at": cached["created_at"],
                     "fundamentals": json.loads(cached["fundamentals_json"]),
-                    "report": json.loads(cached["report_json"]),
+                    "report": report,
                 }
 
         tin_before, tout_before, cost_before = _get_ledger_snapshot(clean_ticker, db_path=db_path)
@@ -212,26 +265,35 @@ def get_or_generate_pull_report(
         # 4. Map Step (Tier 2: gemini-2.5-flash): Distill management promises & commentary per document
         distilled_notes: list[dict[str, Any]] = []
         map_model: str | None = None  # stays None if there were no PDFs or the map step failed
+        docs_by_id = {f"D{i}": d for i, d in enumerate(primary_docs, 1)}
         if primary_docs:
             docs_payload = [
                 {
+                    "doc_id": doc_id,
                     "period": d["period"],
                     "doc_type": d["doc_type"],
                     "url": d["url"],
-                    "excerpt": d["text"][:12000],
+                    "excerpt": d["text"][: AR_MAX_CHARS if d["doc_type"] == "Annual Report" else CONCALL_EXCERPT_CHARS],
                 }
-                for d in primary_docs
+                for doc_id, d in docs_by_id.items()
             ]
             map_prompt = f"""You are a primary-source financial analyst extracting management commentary for {fundamentals['company_name']} ({clean_ticker}).
-Analyze the following primary documents (Concall Transcripts, Investor Presentations, Annual Report) and extract ONLY explicit statements, guidance, growth/margin commentary, capex plans, and segment drivers stated by management.
+Analyze the following primary documents (Concall Transcripts, Investor Presentations, Annual Report) and extract ONLY explicit statements, guidance, growth/margin commentary, capex plans, and segment drivers stated by management, plus the audited disclosures listed below for the Annual Report.
 Do NOT use outside knowledge or broker opinions.
 
 Return a JSON array of objects, one per document, with keys:
+- "doc_id": string (copy the document's doc_id exactly)
 - "period": string (matching document period)
 - "doc_type": string
 - "stated_guidance_and_promises": list of specific forward-looking claims, growth targets, margin expectations, or execution milestones management stated
 - "segment_and_demand_commentary": list of key operational highlights or headwinds discussed
 - "notable_quotes_or_facts": list of 1-2 verbatim or near-verbatim factual statements with page reference if visible
+For the doc_type "Annual Report" document ONLY, also include these keys (each a list of short factual strings with ₹ amounts and page reference if visible; use [] if the excerpt does not contain it, never guess):
+- "mdna_highlights": business model, industry position, strategy and outlook from Management Discussion & Analysis
+- "segment_performance": each reported segment with its revenue / result numbers
+- "contingent_liabilities": nature and amount of contingent liabilities and claims not acknowledged as debt
+- "related_party_transactions": material related party transactions with counterparty and amount
+- "auditor_report": audit opinion type (unmodified / qualified), key audit matters, emphasis of matter or qualifications
 
 Primary Documents:
 {json.dumps(docs_payload, ensure_ascii=False)}
@@ -247,6 +309,22 @@ Primary Documents:
                 distilled_notes = mapped if isinstance(mapped, list) else mapped.get("documents", [])
             except Exception as exc:
                 print(f"[pull_engine] Map step warning for {clean_ticker}: {exc}")
+
+        # Tie each distilled note to the real document it came from (ID, period, URL) so it can be cached and cited.
+        # Falls back to period + doc_type if the model dropped doc_id; notes matching no parsed document are dropped.
+        document_notes: list[dict[str, Any]] = []
+        for note in distilled_notes:
+            if not isinstance(note, dict):
+                continue
+            doc_id = str(note.get("doc_id") or "")
+            if doc_id not in docs_by_id:
+                doc_id = next(
+                    (k for k, d in docs_by_id.items() if (d["period"], d["doc_type"]) == (note.get("period"), note.get("doc_type"))),
+                    "",
+                )
+            if doc_id:
+                d = docs_by_id[doc_id]
+                document_notes.append({**note, "doc_id": doc_id, "period": d["period"], "doc_type": d["doc_type"], "url": d["url"]})
 
         # 5. Reduce Step (Tier 3: gemini-2.5-pro / fallback): Synthesize the 8 Pull Research Modules
         primary_bundle = {
@@ -268,6 +346,8 @@ Primary Documents:
             },
         }
 
+        no_call_quarters = _quarters_without_prior_call(q_headers[-4:], fundamentals.get("concalls") or [])
+
         reduce_prompt = f"""You are FINN, a high-conviction institutional investment analyst for ENAM Holdings.
 Generate a complete, deeply analytical Pull Research Report for {fundamentals['company_name']} ({clean_ticker}).
 
@@ -275,6 +355,7 @@ STRICT DISCIPLINE:
 - Ground EVERY number, ratio, trajectory claim, and narrative comparison strictly in the provided Primary Source Bundle (Screener 10Y audited financials, quarterly exchange results, concall transcripts, investor presentations, and annual reports).
 - NO broker notes, NO news commentary, NO ungrounded outside assumptions.
 - Zero AI slop: write with high information density, sharp institutional judgment, and exact numbers (with ₹ Cr and % units).
+- ANNUAL REPORT EVIDENCE: the `distilled_concall_and_ar_evidence` entry with doc_type "Annual Report" holds audited disclosures. Use its `mdna_highlights` and `segment_performance` for `business_snapshot.overview` and `business_snapshot.segments` (prefer reported segment numbers over inference). In `balance_sheet.summary`, state the contingent liabilities, material related party transactions and the auditor's opinion / key audit matters from it; if no Annual Report entry or field is present, say they were not found in the loaded Annual Report pages instead of guessing.
 - BANKING & NBFC DOMAIN RULE (e.g., HDFCBANK, BAJFINANCE, banks/lenders where Screener reports 'Financing Profit', 'Financing Margin %', or 'Interest' instead of standard manufacturing/services EBITDA):
   1) Map 'Financing Margin %' (or NIM / PPOP margin) into `latest_opm_pct` and `opm_pct` chart fields, and label it clearly in prose.
   2) Do NOT flag high Borrowings / Deposits or high Debt-to-Equity as balance-sheet distress for a Bank or NBFC—deposits and borrowings are their core lending raw material. Instead evaluate Balance Sheet health on Capital Adequacy (CRAR/Tier-1), Asset Quality (GNPA/NNPA, credit costs), Reserves compounding, and ROE/ROA.
@@ -375,6 +456,7 @@ Return a single valid JSON object with the exact 8 modules below:
 
 Note on `annual_series` (last 5 years), `quarterly_series` (last 6 quarters), and `annual_cash_vs_pat` (last 4 years): populate numeric floats (strip commas) directly from the Screener tables so charts render accurately.
 Note on `quarters_audit`: MUST include 4 entries corresponding to the last 4 reported quarters in `quarterly_results_table`.
+Quarters with no prior concall/presentation: {json.dumps(no_call_quarters)}. For each of these, set `management_narrative` and `verdict` to exactly "No guidance" (do not carry older guidance forward) and use `audit_note` for the reported numbers only.
 
 Primary Source Bundle:
 {json.dumps(primary_bundle, ensure_ascii=False)}
@@ -386,6 +468,11 @@ Primary Source Bundle:
             db_path=db_path,
         )
         report["models_used"] = {"map": map_model, "reduce": reduce_model}
+        report["document_notes"] = document_notes
+        # Enforce the prompt rule: a quarter with no prior call has no guidance to audit against.
+        for row in (report.get("narrative_vs_numbers") or {}).get("quarters_audit") or []:
+            if isinstance(row, dict) and any(q in str(row.get("quarter", "")) for q in no_call_quarters):
+                row["management_narrative"] = row["verdict"] = "No guidance"
 
         # Attach source provenance metadata to report
         report["sources_used"] = {
@@ -750,9 +837,11 @@ def ask_pull_copilot(
     ticker: str,
     question: str,
     db_path: Path = DB_PATH,
+    history: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """
-    On-demand Q&A grounded strictly in the company's primary fundamentals and Pull report.
+    On-demand Q&A grounded strictly in the company's primary fundamentals, Pull report and the distilled
+    document notes cached with it. `history` is the last Q&A turns (oldest first); only the last 2 are used.
     Uses Tier-2 (gemini-2.5-flash) for fast, low-cost interactive responses.
     """
     clean_ticker = normalize_ticker(ticker)
@@ -770,19 +859,10 @@ def ask_pull_copilot(
         "Screener Cash Flow Table",
         "Screener Ratios Table",
     ]
-    sources_used = report.get("sources_used") or {}
-    for d in sources_used.get("documents_parsed") or []:
-        if d.get("url"):
-            available_source_tags.append(f"{d.get('period', 'Recent')} {d.get('doc_type', 'Concall')}".strip())
-    for c in (fundamentals.get("concalls") or [])[:4]:
-        p = c.get("period", "")
-        if c.get("transcript_url") and f"{p} Concall Transcript" not in available_source_tags:
-            available_source_tags.append(f"{p} Concall Transcript".strip())
-        elif c.get("ppt_url") and f"{p} Investor Presentation" not in available_source_tags:
-            available_source_tags.append(f"{p} Investor Presentation".strip())
-    for ar in (fundamentals.get("annual_reports") or [])[:3]:
-        if ar.get("url") and ar.get("title"):
-            available_source_tags.append(ar["title"])
+    # Only documents whose distilled notes are in this prompt are citable; unread PDFs on Screener are not.
+    document_notes = [n for n in report.get("document_notes") or [] if isinstance(n, dict)]
+    doc_tags = [f"{n.get('period', '')} {n.get('doc_type', '')}".strip() for n in document_notes]
+    available_source_tags.extend(doc_tags)
     available_source_tags.extend(
         [
             "Synthesized Report (Narrative vs. Numbers)",
@@ -801,21 +881,35 @@ def ask_pull_copilot(
         "balance_sheet": fundamentals.get("balance_sheet"),
         "cash_flow": fundamentals.get("cash_flow"),
         "ratios": fundamentals.get("ratios"),
-        "synthesized_report": report,
+        # Notes go before the report so the char cap below trims the report, not the citable documents.
+        "document_notes": [
+            {"source_tag": tag, **{k: v for k, v in n.items() if k != "url"}} for tag, n in zip(doc_tags, document_notes)
+        ],
+        "synthesized_report": {k: v for k, v in report.items() if k != "document_notes"},
     }
+    recent_turns = [
+        {"question": str(t.get("question", ""))[:1000], "answer": str(t.get("answer", ""))[:4000]}
+        for t in (history or [])[-2:]
+        if isinstance(t, dict)
+    ]
 
     prompt = f"""You are FINN, an institutional equity research copilot grounded STRICTLY in primary company filings for {fundamentals.get('company_name')} ({clean_ticker}).
-Answer the investor's question concisely using ONLY the primary financial tables and concall/AR synthesis below.
-Cite exact figures (₹ Cr, %, YoY/QoQ) from the data. If the primary data does not contain the answer, state that clearly instead of guessing.
+Answer the investor's question concisely using ONLY the Screener tables, the distilled document notes (`document_notes`) and the synthesized report below.
+You have NOT read any concall transcript, presentation or annual report beyond what `document_notes` contains. You may only cite documents present in this context.
+Cite exact figures (₹ Cr, %, YoY/QoQ) from the data. If the provided sources do not contain the answer, say clearly that it is not in the loaded filings/transcripts instead of guessing, and return an empty `citations` list.
+`recent_conversation` holds the last Q&A turns only to resolve follow-up questions. It is not a source: never cite it.
 
 Investor Question: {question}
 
 Return a JSON object with:
 - "answer": Concise, high-signal markdown response (2-4 bullet points or short paragraph with bold numbers).
-- "citations": list of 1-3 exact source tags chosen from `available_sources` in the context that directly support your answer (do NOT invent citations outside `available_sources`).
+- "citations": list of 0-3 exact source tags chosen from `available_sources` (a document's tag is its `source_tag` in `document_notes`) that directly support your answer. Never cite anything outside `available_sources`.
+
+Recent Conversation:
+{json.dumps({"recent_conversation": recent_turns}, ensure_ascii=False)}
 
 Primary Data Context:
-{json.dumps(context, ensure_ascii=False)[:40000]}
+{json.dumps(context, ensure_ascii=False)[:60000]}
 """
     res, served_by = _call_gemini_json_with_model(
         prompt=prompt,
@@ -831,6 +925,14 @@ Primary Data Context:
         and not any("report" in str(c).lower() or "narrative" in str(c).lower() for c in raw_citations)
     ):
         raw_citations.append("Synthesized Report")
+    # Drop document citations the model was never shown (e.g. an older transcript listed on Screener but not loaded).
+    doc_words = ("concall", "transcript", "earnings call", "conference call", "presentation", "ppt", "annual report")
+    loaded = [t.lower() for t in doc_tags if t]
+    raw_citations = [
+        c
+        for c in raw_citations
+        if not any(w in str(c).lower() for w in doc_words) or any(t in str(c).lower() for t in loaded)
+    ]
     citation_links = resolve_copilot_citations(raw_citations, fundamentals, report, db_path=db_path)
     return {
         "ticker": clean_ticker,

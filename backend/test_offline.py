@@ -201,6 +201,8 @@ def test_paid_endpoints_are_guarded() -> None:
         assert client.get("/api/pull/TRENT?force=true").status_code == 401
         assert client.get("/api/pull/ZZTESTCO").status_code == 429  # uncached -> would cost money
         assert client.post("/api/pull/ZZTESTCO/ask", json={"question": "q"}).status_code == 429
+        turn = {"question": "q", "answer": "a"}
+        assert client.post("/api/pull/ZZTESTCO/ask", json={"question": "q", "history": [turn] * 3}).status_code == 422
         r = client.get("/api/pull/TRENT")  # cached report costs $0, so it is served even with no budget
         assert r.status_code == 200 and r.json()["cached"] is True, r.status_code
     main._rate_hits.clear()
@@ -292,6 +294,189 @@ def test_fallback_walks_pro_chain_and_logs() -> None:
     finally:
         llm_router._get_client = orig_client
         llm_router._UNAVAILABLE_MODELS.clear()
+
+
+def test_annual_report_read_alongside_concalls() -> None:
+    import re
+    import fitz
+    from backend import pull_engine
+
+    # 60-page fake AR: cover pages 0-2, the 5 brief sections scattered, everything else filler.
+    sections = {
+        8: "Management Discussion and Analysis: industry structure, opportunities and threats.",
+        15: "Segment information: segment revenue and segment results by operating segment.",
+        22: "Contingent liabilities: claims against the company not acknowledged as\ndebt Rs 120 Cr.",
+        28: "Related party transactions with key managerial personnel.",
+        41: "Independent Auditor's Report. Basis for Opinion. Key Audit Matters.",
+    }
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        ar_pdf = Path(tmp) / "ar.pdf"
+        doc = fitz.open()
+        for i in range(60):
+            page = doc.new_page()
+            body = f"PAGE{i} {sections.get(i, 'Sustainability narrative and CSR spend.')} " + "filler " * 600
+            assert page.insert_textbox(page.rect + (36, 36, -36, -36), body, fontsize=5) >= 0, "text overflowed"
+        doc.save(ar_pdf)
+        doc.close()
+
+        real, fetched = pull_engine.extract_pdf_text, []
+
+        def fake_extract(url, **kw):
+            fetched.append(url)
+            return real(ar_pdf, **kw) if url == "https://x/ar25.pdf" else "management guided growth " * 50
+
+        pull_engine.extract_pdf_text = fake_extract
+        try:
+            docs = pull_engine._extract_primary_documents({
+                "concalls": [{"period": f"Q{i}", "transcript_url": f"https://x/cc{i}.pdf"} for i in range(4)],
+                "annual_reports": [{"title": "Financial Year 2025", "url": "https://x/ar25.pdf"},
+                                   {"title": "Financial Year 2024", "url": "https://x/ar24.pdf"}],
+            })
+        finally:
+            pull_engine.extract_pdf_text = real
+
+    assert [d["doc_type"] for d in docs] == ["Concall Transcript"] * 4 + ["Annual Report"], docs
+    assert "https://x/ar24.pdf" not in fetched, "only the latest AR should be downloaded"
+    ar = docs[-1]
+    assert ar["period"] == "Financial Year 2025"
+    pages = {int(n) for n in re.findall(r"PAGE(\d+) ", ar["text"])}
+    assert pages == {0, 1, 2, *sections}, pages  # cover + every section page, no filler
+    assert len(ar["text"]) <= pull_engine.AR_MAX_CHARS
+    for chunk in ar["text"].split("\n--- [Page")[1:]:
+        assert len(chunk) <= pull_engine.AR_MAX_CHARS_PER_PAGE + 40, len(chunk)
+
+
+def test_distilled_notes_persisted_in_cached_report() -> None:
+    from backend import pull_engine
+
+    docs = [
+        {"period": "Feb 2026", "doc_type": "Concall Transcript", "url": "https://x/cc.pdf", "text": "t"},
+        {"period": "Financial Year 2025", "doc_type": "Annual Report", "url": "https://x/ar.pdf", "text": "t"},
+    ]
+    mapped = [  # model echoed D2's id, dropped D1's id (matched by period + doc_type), and invented a third doc
+        {"doc_id": "D2", "period": "FY25", "doc_type": "Annual Report", "contingent_liabilities": ["Rs 120 Cr"]},
+        {"period": "Feb 2026", "doc_type": "Concall Transcript", "stated_guidance_and_promises": ["15% growth"]},
+        {"doc_id": "D9", "period": "Nov 2025", "doc_type": "Concall Transcript"},
+    ]
+    fundamentals = {k: {} for k in ("top_ratios", "quarters", "profit_loss", "balance_sheet", "cash_flow", "ratios")}
+    fundamentals.update(company_name="Test Co", about="", screener_url="https://x", concalls=[], annual_reports=[])
+    patches = {
+        "fetch_screener_fundamentals": lambda t: fundamentals,
+        "_get_material_filings": lambda t, db: [],
+        "_extract_primary_documents": lambda f, n: docs,
+        "_call_gemini_json_with_model": lambda **kw: (mapped, "flash"),
+        "call_gemini_pro_json": lambda **kw: ({}, "pro"),
+    }
+    orig = {k: getattr(pull_engine, k) for k in patches}
+    try:
+        for k, v in patches.items():
+            setattr(pull_engine, k, v)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            db = Path(tmp) / "pull.db"
+            init_db(db)
+            pull_engine.get_or_generate_pull_report("ZZTESTCO", force_refresh=True, db_path=db)
+            cached = pull_engine.get_or_generate_pull_report("ZZTESTCO", db_path=db)
+            assert cached["cached"] is True
+            notes = cached["report"]["document_notes"]
+            assert [(n["doc_id"], n["period"], n["doc_type"], n["url"]) for n in notes] == [
+                ("D2", "Financial Year 2025", "Annual Report", "https://x/ar.pdf"),
+                ("D1", "Feb 2026", "Concall Transcript", "https://x/cc.pdf"),
+            ], notes
+            assert notes[0]["contingent_liabilities"] == ["Rs 120 Cr"]
+
+            # A report cached before this field existed still loads, with an empty notes list
+            conn = sqlite3.connect(db)
+            conn.execute("UPDATE pull_reports_cache SET report_json = '{\"sources_used\": {}}' WHERE ticker = 'ZZTESTCO'")
+            conn.commit()
+            conn.close()
+            assert pull_engine.get_or_generate_pull_report("ZZTESTCO", db_path=db)["report"]["document_notes"] == []
+    finally:
+        for k, v in orig.items():
+            setattr(pull_engine, k, v)
+
+
+def test_quarters_without_prior_call_say_no_guidance() -> None:
+    from backend import pull_engine
+
+    # HAL-style: one concall a year, in May. Only the Jun quarter has a call in its 3 months.
+    headers = ["Sep 2025", "Dec 2025", "Mar 2026", "Jun 2026"]
+    concalls = [{"period": "May 2026"}, {"period": "May 2025"}, {"period": "Recent Quarter"}]
+    assert pull_engine._quarters_without_prior_call(headers, concalls) == ["Sep 2025", "Dec 2025", "Mar 2026"]
+
+    fundamentals = {k: {} for k in ("top_ratios", "profit_loss", "balance_sheet", "cash_flow", "ratios")}
+    fundamentals.update(company_name="Test Co", about="", screener_url="https://x", annual_reports=[],
+                        quarters={"headers": headers}, concalls=concalls)
+    rows = [{"quarter": q, "management_narrative": "Guided 10% growth", "verdict": "Beat"} for q in headers]
+    patches = {
+        "fetch_screener_fundamentals": lambda t: fundamentals,
+        "_get_material_filings": lambda t, db: [],
+        "_extract_primary_documents": lambda f, n: [],
+        "call_gemini_pro_json": lambda **kw: ({"narrative_vs_numbers": {"quarters_audit": rows}}, "pro"),
+    }
+    orig = {k: getattr(pull_engine, k) for k in patches}
+    try:
+        for k, v in patches.items():
+            setattr(pull_engine, k, v)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            db = Path(tmp) / "pull.db"
+            init_db(db)
+            out = pull_engine.get_or_generate_pull_report("ZZTESTCO", force_refresh=True, db_path=db)
+        got = [(r["quarter"], r["management_narrative"], r["verdict"]) for r in out["report"]["narrative_vs_numbers"]["quarters_audit"]]
+        assert got == [(q, "No guidance", "No guidance") for q in headers[:3]] + [("Jun 2026", "Guided 10% growth", "Beat")], got
+    finally:
+        for k, v in orig.items():
+            setattr(pull_engine, k, v)
+
+
+def test_copilot_sees_notes_and_history_and_cites_only_loaded_docs() -> None:
+    from backend import pull_engine
+
+    fundamentals = {
+        "company_name": "Test Co", "ticker": "ZZTESTCO", "screener_url": "https://x",
+        "quarters": {"headers": ["Dec 2025"]},
+        "concalls": [{"period": "Feb 2026", "transcript_url": "https://x/cc-feb26.pdf"},
+                     {"period": "Nov 2024", "transcript_url": "https://x/cc-nov24.pdf"}],  # Nov 2024 listed, never read
+        "annual_reports": [],
+    }
+    report = {
+        "sources_used": {"documents_parsed": [{"period": "Feb 2026", "doc_type": "Concall Transcript", "url": "https://x/cc-feb26.pdf"}]},
+        "document_notes": [{"doc_id": "D1", "period": "Feb 2026", "doc_type": "Concall Transcript",
+                            "url": "https://x/cc-feb26.pdf", "stated_guidance_and_promises": ["GUIDE-18PCT-FY27"]}],
+    }
+    seen: dict[str, str] = {}
+
+    def fake_llm(**kw):
+        seen["prompt"] = kw["prompt"]
+        return {"answer": "Guided 18%.", "citations": ["Feb 2026 Concall Transcript", "Nov 2024 Concall Transcript"]}, "flash"
+
+    patches = {
+        "get_or_generate_pull_report": lambda t, force_refresh=False, db_path=None: {"fundamentals": fundamentals, "report": report},
+        "_call_gemini_json_with_model": fake_llm,
+    }
+    orig = {k: getattr(pull_engine, k) for k in patches}
+    orig_ask, orig_guard = main.ask_pull_copilot, main._guard_paid_call
+    try:
+        for k, v in patches.items():
+            setattr(pull_engine, k, v)
+        history = [{"question": f"OLDQ{i}", "answer": f"OLDA{i}"} for i in range(3)]
+        out = pull_engine.ask_pull_copilot("ZZTESTCO", "What is FY27 guidance?", history=history)
+        p = seen["prompt"]
+        assert "GUIDE-18PCT-FY27" in p and '"source_tag": "Feb 2026 Concall Transcript"' in p
+        assert "OLDQ1" in p and "OLDA2" in p and "OLDQ0" not in p, "only the last 2 turns go in"
+        assert "not in the loaded filings/transcripts" in p and "only cite documents present" in p
+        assert "Nov 2024" not in p, "a transcript listed on Screener but never read is offered as a source"
+        assert [(c["label"], c["url"]) for c in out["citation_links"]] == [("Feb 2026 Concall Transcript", "https://x/cc-feb26.pdf")]
+
+        # The API route forwards the chat history to the copilot
+        got: dict = {}
+        main._guard_paid_call = lambda request, bucket: None
+        main.ask_pull_copilot = lambda **kw: got.update(kw) or {"ticker": kw["ticker"]}
+        r = TestClient(main.app).post("/api/pull/ZZTESTCO/ask", json={"question": "q", "history": history[1:]})
+        assert r.status_code == 200 and got["history"] == history[1:], (r.status_code, got)
+    finally:
+        for k, v in orig.items():
+            setattr(pull_engine, k, v)
+        main.ask_pull_copilot, main._guard_paid_call = orig_ask, orig_guard
 
 
 if __name__ == "__main__":

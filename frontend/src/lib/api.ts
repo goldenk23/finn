@@ -150,10 +150,15 @@ export const finnApi = {
       signal ? { signal } : undefined
     ),
 
-  askPullCopilot: (ticker: string, question: string, signal?: AbortSignal) =>
+  askPullCopilot: (
+    ticker: string,
+    question: string,
+    history: { question: string; answer: string }[] = [],
+    signal?: AbortSignal
+  ) =>
     request<CopilotQAResponse>(`/api/pull/${encodeURIComponent(ticker)}/ask`, {
       method: "POST",
-      body: JSON.stringify({ question }),
+      body: JSON.stringify({ question, history }),
       ...(signal ? { signal } : {}),
     }),
 

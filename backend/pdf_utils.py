@@ -100,11 +100,13 @@ def extract_pdf_text(
     max_pages: int = 15,
     keywords: list[str] | None = None,
     max_chars: int = 45000,
+    max_chars_per_page: int | None = None,
 ) -> str:
     """
     Extract text from a PDF (local path or URL) using PyMuPDF.
     If keywords are passed (or mode='results'), prioritizes the cover pages + pages with highest keyword hits
     so large 100-page filings don't waste LLM tokens.
+    `max_chars_per_page` trims each selected page so late pages aren't crowded out by the `max_chars` cap.
     """
     pdf_path: Path | None
     if isinstance(url_or_path, Path):
@@ -135,7 +137,8 @@ def extract_pdf_text(
             for idx in range(total_pages):
                 if idx in must_keep:
                     continue
-                page_txt = doc[idx].get_text("text").lower()
+                # Collapse whitespace so multi-word keywords still match when wrapped across lines
+                page_txt = " ".join(doc[idx].get_text("text").lower().split())
                 score = sum(1 for k in kw_lower if k in page_txt)
                 if score > 0:
                     scored.append((score, idx))
@@ -153,7 +156,7 @@ def extract_pdf_text(
         chunks: list[str] = []
         total_len = 0
         for idx in selected_indices:
-            txt = doc[idx].get_text("text").strip()
+            txt = doc[idx].get_text("text").strip()[:max_chars_per_page]
             if not txt:
                 continue
             header = f"\n--- [Page {idx + 1} of {total_pages}] ---\n"

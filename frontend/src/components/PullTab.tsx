@@ -912,7 +912,13 @@ export function PullTab({
     try {
       setAsking(true);
       setQaError(null);
-      const res = await finnApi.askPullCopilot(targetTicker, cleanQ, controller.signal);
+      // qaHistory is newest-first; send this ticker's last 2 turns oldest-first, trimmed to the backend's field limits.
+      const history = qaHistory
+        .filter((t) => t.ticker === targetTicker)
+        .slice(0, 2)
+        .reverse()
+        .map((t) => ({ question: t.question.slice(0, 1000), answer: t.answer.slice(0, 4000) }));
+      const res = await finnApi.askPullCopilot(targetTicker, cleanQ, history, controller.signal);
       if (reqId !== askReqIdRef.current) return;
       if ((res.ticker || "").toUpperCase() !== targetTicker) return;
       setQaHistory((prev) => [res, ...prev]);
@@ -1264,7 +1270,7 @@ export function PullTab({
                     </span>
                   </div>
                   <p className="text-[10.5px] text-zinc-300 mt-0.5">
-                    Interrogate 10Y financials, quarterly tables &amp; concall transcripts with exact citations
+                    Answers from Screener 10Y &amp; quarterly tables, this report, and distilled notes from the concalls &amp; annual report it parsed. Cites only those sources.
                   </p>
                 </div>
               </div>
