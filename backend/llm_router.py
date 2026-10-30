@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from dotenv import load_dotenv
@@ -341,6 +342,8 @@ def _parse_num(val: Any) -> float | None:
     s = str(val).replace(",", "").replace("₹", "").replace("Cr", "").replace("%", "").strip()
     if not s or s.lower() in ("n/a", "-", "none", "null"):
         return None
+    if s.startswith("(") and s.endswith(")"):  # accounting negative, e.g. "(793)"
+        s = "-" + s[1:-1]
     try:
         return float(s)
     except ValueError:
@@ -359,7 +362,7 @@ def _format_inr(val: Any) -> str:
 def _format_pct(val: Any) -> str:
     num = _parse_num(val)
     if num is None:
-        return "—"
+        return "n/a" if str(val).strip().lower() == "n/a" else "—"
     return f"{num:+.1f}%"
 
 
@@ -375,6 +378,254 @@ def _normalize_results_enrichment(res: dict[str, Any]) -> dict[str, Any]:
     res["metrics"] = metrics
     res["unit"] = "₹ Cr"
     return res
+
+
+# Results-card definitions, shared by the PDF path and the Screener path so both show the same numbers.
+# They follow Screener's quarterly table:
+# - Revenue = revenue from operations (banks: total interest earned). Other income is never revenue.
+# - Non-financials: EBITDA = revenue - total expenses + finance costs + D&A, i.e. Screener's "Operating Profit".
+#   Other income and exceptional items are excluded.
+# - Banks/NBFCs: Financing Profit = revenue - interest expended - operating expenses (ex-D&A) - provisions,
+#   i.e. Screener's "Financing Profit". It is after provisions, so it is NOT PPOP, and it excludes other income.
+#   Ind AS NBFC tables (BAJFINANCE) carry finance costs and impairment inside total expenses, so there it is
+#   revenue - total expenses + D&A. RBI-format bank tables report D&A inside operating expenses, and Screener
+#   shows bank depreciation as 0, so nothing is added back there.
+# - PAT = net profit for the period before the non-controlling-interest split (Screener's "Net Profit").
+UNIT_TO_CR = {"crore": 1.0, "lakh": 0.01, "million": 0.1, "billion": 100.0, "thousand": 0.0001}
+_BANK_KEYS = ("interest_earned", "other_income", "interest_expended", "operating_expenses", "provisions")
+_STANDARD_KEYS = ("revenue_from_operations", "other_income", "total_expenses")
+
+# Cross-check tolerance once the PDF and Screener are on the same quarter and basis. Q2 FY27 (Sep 2026) filings vs
+# Screener, same definitions: CIPLA consolidated revenue 7,403.93 vs 7,404, EBITDA 1,387.78 vs 1,388, PBT 1,177.34
+# vs 1,177, PAT 851.51 vs 852; BAJFINANCE consolidated revenue 24,546.37 vs 24,546, Financing Profit 8,825.09 vs
+# 8,825, PBT 8,537.20 vs 8,537, PAT 6,366.57 vs 6,367. The worst gap is 0.06% (0.49 Cr), which is Screener rounding
+# to whole crores. 1% (or 1 Cr on small numbers) still rejects the old definition errors: CIPLA EBITDA incl. other
+# income +11%, BAJFINANCE PPOP vs Financing Profit +21%, CIPLA PAT attributable to owners +3%.
+SCREENER_MATCH_REL_TOL = 0.01
+SCREENER_MATCH_ABS_TOL_CR = 1.0
+
+# Words a results takeaway may not use when PAT or the operating line fell QoQ or YoY
+_HYPE_WORDS = re.compile(r"\b(strong|robust|stellar|impressive|healthy|solid|excellent)\b", re.IGNORECASE)
+
+
+def _pct_change(curr: float | None, base: float | None) -> str:
+    """'—' when a number is missing, 'n/a' when the base is zero or negative (a % off it would mislead)."""
+    if curr is None or base is None:
+        return "—"
+    if base <= 0:
+        return "n/a"
+    return f"{(curr - base) / base * 100.0:+.1f}%"
+
+
+def _metric(series: tuple[float | None, float | None, float | None]) -> dict[str, str]:
+    curr, prev, year_ago = series
+    return {
+        "value": _format_inr(curr) if curr is not None else "—",
+        "qoq_pct": _pct_change(curr, prev),
+        "yoy_pct": _pct_change(curr, year_ago),
+    }
+
+
+def _operating_profit(items: dict[str, float], bank: bool, financial: bool) -> float | None:
+    """EBITDA (non-financials) or Financing Profit (banks/NBFCs) from raw ₹ Cr line items, other income excluded."""
+    if bank:
+        parts = [items.get(k) for k in ("interest_earned", "interest_expended", "operating_expenses", "provisions")]
+        return None if None in parts else parts[0] - parts[1] - parts[2] - parts[3]
+    rev, total_exp, fin, da = (
+        items.get(k) for k in ("revenue_from_operations", "total_expenses", "finance_costs", "depreciation_amortisation")
+    )
+    if rev is None or total_exp is None or da is None or (fin is None and not financial):
+        return None
+    return rev - total_exp + da + (0.0 if financial else fin)
+
+
+def _signed_exceptional(items: dict[str, float], bank: bool) -> float | None:
+    """
+    Filings print exceptional items either signed or as a positive amount that is then subtracted
+    (SUNPHARMA: 'PBT (V-VI)'). Pick the sign that reconciles profit before exceptional items to the printed PBT.
+    ponytail: a share of associates booked above PBT shifts both candidates equally, so this only picks the wrong
+    sign if that share is bigger than the exceptional item itself.
+    """
+    exc, pbt = items.get("exceptional_items"), items.get("pbt")
+    vals = [items.get(k) for k in (_BANK_KEYS if bank else _STANDARD_KEYS)]
+    if not exc or pbt is None or None in vals:
+        return exc
+    pre = vals[0] + vals[1] - sum(vals[2:])
+    return -abs(exc) if abs(pre - abs(exc) - pbt) < abs(pre + abs(exc) - pbt) else abs(exc)
+
+
+def _month_key(text: Any) -> int | None:
+    """'Sep 2026' / 'Q2 FY27 (Sep 2026)' / 'September 2026' -> year*12 + month (same index as pull_engine)."""
+    if isinstance(text, int):
+        return text
+    m = re.search(r"\b([A-Za-z]{3})[a-z]*\.?\s+(\d{4})\b", str(text or ""))
+    if not m:
+        return None
+    try:
+        d = datetime.strptime(f"{m.group(1).title()} {m.group(2)}", "%b %Y")
+    except ValueError:
+        return None
+    return d.year * 12 + d.month
+
+
+def _period_label(quarter_end: str) -> str:
+    from backend.pull_engine import _fiscal_label  # lazy: pull_engine imports this module
+
+    key = _month_key(quarter_end)
+    return f"{_fiscal_label(key)} ({quarter_end})" if key and key % 3 == 0 else (quarter_end or "")
+
+
+def _basis_note(basis: str, financial: bool) -> str:
+    definition = "Financing Profit ex-other income, after provisions" if financial else "EBITDA ex-other income"
+    return " • ".join(p for p in (basis, definition) if p)
+
+
+def _results_from_pdf_items(
+    raw: dict[str, Any], filing_title: str, is_financial: bool | None = None
+) -> tuple[dict[str, Any], dict[str, tuple]] | None:
+    """
+    Turn the LLM's raw line items (3 quarter columns, printed unit) into card metrics. All arithmetic is here.
+    `is_financial` comes from Screener when available (its table says "Financing Profit"); else the LLM's flag.
+    Returns (result, raw ₹ Cr series per metric) or None when the unit is unknown.
+    """
+    from backend.pull_engine import _filing_quarter  # lazy: pull_engine imports this module
+
+    unit = str(raw.get("unit_as_printed") or "").lower()
+    factor = next((f for u, f in UNIT_TO_CR.items() if u in unit), None)
+    cols = raw.get("columns") if isinstance(raw.get("columns"), dict) else {}
+    if factor is None or not cols:
+        return None
+    per: list[dict[str, float]] = []
+    for key in ("current", "previous", "year_ago"):
+        col = cols.get(key) if isinstance(cols.get(key), dict) else {}
+        per.append({k: n * factor for k, n in ((k, _parse_num(v)) for k, v in col.items()) if n is not None})
+
+    bank = per[0].get("interest_earned") is not None
+    financial = bank or (is_financial if is_financial is not None else bool(raw.get("is_bank_or_nbfc")))
+    rev_key = "interest_earned" if bank else "revenue_from_operations"
+    series = {
+        "revenue": tuple(i.get(rev_key) for i in per),
+        "ebitda": tuple(_operating_profit(i, bank, financial) for i in per),
+        "pbt": tuple(i.get("pbt") for i in per),
+        "pat": tuple(i.get("pat") for i in per),
+    }
+    q = _month_key(raw.get("quarter_end")) or _filing_quarter(filing_title)
+    quarter_end = datetime((q - 1) // 12, (q - 1) % 12 + 1, 1).strftime("%b %Y") if q else ""
+    basis_raw = str(raw.get("basis") or "").lower()
+    basis = "Consolidated" if "consol" in basis_raw else "Standalone" if "standalone" in basis_raw else ""
+    exc = _signed_exceptional(per[0], bank) or 0.0
+    return (
+        {
+            "has_numbers": True,
+            "quarter_end": quarter_end,
+            "period": _period_label(quarter_end),
+            "unit": "₹ Cr",
+            "basis": basis,
+            "is_financial": financial,
+            "operating_label": "Financing Profit" if financial else "EBITDA",
+            "basis_note": _basis_note(basis, financial),
+            "exceptional_items_cr": round(exc, 2),
+            "metrics": {k: _metric(v) for k, v in series.items()},
+        },
+        series,
+    )
+
+
+def _screener_gate(quarter: Any, basis: str | None, sc_ref: dict[str, Any] | None) -> str:
+    """'match' only when Screener's latest column is the filing's quarter (and basis, when known)."""
+    if not sc_ref:
+        return "pdf_only_no_screener"
+    pq, sq = _month_key(quarter), _month_key(sc_ref.get("quarter_end") or sc_ref.get("period"))
+    if pq is None or sq is None:
+        return "pdf_only_quarter_unknown"
+    if pq > sq:
+        return "pdf_only_screener_behind"
+    if pq < sq:
+        return "pdf_only_screener_ahead"
+    if basis is not None and basis.lower() != (sc_ref.get("basis") or "").lower():
+        return "pdf_only_basis_mismatch"
+    return "match"
+
+
+def _takeaway_ok(text: str, res: dict[str, Any], series: dict[str, tuple]) -> bool:
+    """An LLM takeaway must not hype a falling quarter, must name exceptional items, and may only quote computed %s."""
+    if not text:
+        return False
+    fell = any(
+        s[0] is not None and base is not None and s[0] < base
+        for s in (series.get("ebitda") or (None,) * 3, series.get("pat") or (None,) * 3)
+        for base in s[1:]
+    )
+    if fell and _HYPE_WORDS.search(text):
+        return False
+    exc = res.get("exceptional_items_cr") or 0.0
+    if abs(exc) >= 0.5 and not ("exceptional" in text.lower() and _format_inr(abs(exc)) in text):
+        return False
+    allowed = {p.lstrip("+-") for m in res["metrics"].values() for p in (m["qoq_pct"], m["yoy_pct"])}
+    return all(f"{p}%" in allowed for p in re.findall(r"(\d+(?:\.\d+)?)\s*%", text))
+
+
+def _deterministic_takeaway(ticker: str, res: dict[str, Any]) -> str:
+    m = res["metrics"]
+
+    def part(name: str, key: str) -> str:
+        return f"{name} ₹{m[key]['value']} Cr ({m[key]['qoq_pct']} QoQ, {m[key]['yoy_pct']} YoY)"
+
+    text = (
+        f"{ticker} {res['period']}: {part('revenue', 'revenue')}, "
+        f"{part(res.get('operating_label') or 'EBITDA', 'ebitda')}, {part('PAT', 'pat')}."
+    )
+    exc = res.get("exceptional_items_cr") or 0.0
+    if abs(exc) >= 0.5:
+        text += f" PAT includes an exceptional {'charge' if exc < 0 else 'gain'} of ₹{_format_inr(abs(exc))} Cr."
+    return text
+
+
+def _results_summary(res: dict[str, Any]) -> str:
+    m = res["metrics"]
+    basis = f" {res['basis'].lower()}" if res.get("basis") else ""
+    return (
+        f"{res['period']}{basis} results: revenue ₹{m['revenue']['value']} Cr "
+        f"({m['revenue']['qoq_pct']} QoQ, {m['revenue']['yoy_pct']} YoY), PAT ₹{m['pat']['value']} Cr "
+        f"({m['pat']['qoq_pct']} QoQ, {m['pat']['yoy_pct']} YoY)."
+    )
+
+
+def _results_takeaway(
+    ticker: str, res: dict[str, Any], series: dict[str, tuple], db_path: Path = DB_PATH
+) -> tuple[str, str | None]:
+    """LLM takeaway from the computed numbers, kept only if `_takeaway_ok`; else a sentence built from the numbers."""
+    label = res.get("operating_label") or "EBITDA"
+    m = res["metrics"]
+    exc = res.get("exceptional_items_cr") or 0.0
+    exc_line = (
+        f"Exceptional items this quarter: ₹{_format_inr(abs(exc))} Cr {'charge' if exc < 0 else 'gain'}. Mention them with this amount."
+        if abs(exc) >= 0.5
+        else "No exceptional items this quarter."
+    )
+    prompt = f"""Write a 1-sentence institutional takeaway for {ticker}'s {res['period']} {res.get('basis', '').lower()} results.
+Use only these computed numbers (₹ Cr; {label} excludes other income):
+{json.dumps({"Revenue": m["revenue"], label: m["ebitda"], "PBT": m["pbt"], "PAT": m["pat"]}, ensure_ascii=False)}
+{exc_line}
+Rules: quote percentages exactly as given; if PAT or {label} fell QoQ or YoY, do not call the quarter strong, robust, stellar, impressive, healthy, solid or excellent.
+Return JSON: {{"takeaway": "..."}}"""
+    try:
+        t_res, served_by = _call_gemini_json_with_model(
+            prompt=prompt, model=MODEL_FLASH, workflow="push_enrich_results_takeaway", ticker=ticker, db_path=db_path
+        )
+        text = (t_res.get("takeaway") or "").strip() if isinstance(t_res, dict) else ""
+        if _takeaway_ok(text, res, series):
+            return text, served_by
+        logger.info("[llm] results takeaway for %s rejected by number checks, using template", ticker)
+    except Exception as exc_:
+        logger.warning("[llm] results takeaway for %s fell back to template: %s", ticker, _sanitize_log_message(str(exc_))[:200])
+    return _deterministic_takeaway(ticker, res), None
+
+
+def _finish_results(ticker: str, res: dict[str, Any], series: dict[str, tuple], db_path: Path) -> dict[str, Any]:
+    res["takeaway"], res["takeaway_model"] = _results_takeaway(ticker, res, series, db_path)
+    res["summary"] = _results_summary(res)
+    return _normalize_results_enrichment(res)
 
 
 def _compute_screener_quarterly_metrics(ticker: str) -> dict[str, Any] | None:
@@ -400,81 +651,71 @@ def _compute_screener_quarterly_metrics(ticker: str) -> dict[str, Any] | None:
                 return r
         return None
 
-    rev_row = _find_row(("sales", "revenue"))
-    ebitda_row = _find_row(("operating profit", "financing profit"))
-    pbt_row = _find_row(("profit before tax",))
-    pat_row = _find_row(("net profit",))
-
-    def _build_metric(row: dict[str, Any] | None) -> dict[str, str]:
-        if not row:
-            return {"value": "—", "qoq_pct": "—", "yoy_pct": "—"}
-        v_curr = _parse_num(row.get(q_curr))
-        v_prev = _parse_num(row.get(q_prev))
-        v_yoy = _parse_num(row.get(q_yoy)) if q_yoy else None
-
-        qoq_str = "—"
-        if v_curr is not None and v_prev is not None and v_prev != 0:
-            qoq_str = f"{((v_curr - v_prev) / abs(v_prev)) * 100.0:+.1f}%"
-
-        yoy_str = "—"
-        if v_curr is not None and v_yoy is not None and v_yoy != 0:
-            yoy_str = f"{((v_curr - v_yoy) / abs(v_yoy)) * 100.0:+.1f}%"
-
-        return {
-            "value": _format_inr(v_curr) if v_curr is not None else "—",
-            "qoq_pct": qoq_str,
-            "yoy_pct": yoy_str,
-        }
-
+    op_row = _find_row(("operating profit", "financing profit"))
+    is_financial = bool(op_row) and op_row["metric"].lower().startswith("financing")
+    cols = (q_curr, q_prev, q_yoy)
+    series = {
+        k: tuple(_parse_num(row.get(c)) if row and c else None for c in cols)
+        for k, row in (
+            ("revenue", _find_row(("sales", "revenue"))),
+            ("ebitda", op_row),
+            ("pbt", _find_row(("profit before tax",))),
+            ("pat", _find_row(("net profit",))),
+        )
+    }
+    # fetch_screener_fundamentals tries /consolidated/ first and only drops to standalone when it is empty
+    basis = "Consolidated" if "/consolidated" in (sc_data.get("screener_url") or "") else "Standalone"
     return {
         "has_numbers": True,
-        "period": q_curr,
+        "quarter_end": q_curr,
+        "period": _period_label(q_curr),
         "unit": "₹ Cr",
-        "source": "Screener Primary Filing Data (Consolidated ₹ Cr)",
-        "metrics": {
-            "revenue": _build_metric(rev_row),
-            "ebitda": _build_metric(ebitda_row),
-            "pbt": _build_metric(pbt_row),
-            "pat": _build_metric(pat_row),
-        },
+        "basis": basis,
+        "is_financial": is_financial,
+        "operating_label": "Financing Profit" if is_financial else "EBITDA",
+        "basis_note": _basis_note(basis, is_financial),
+        "source": f"Screener ({basis}, ₹ Cr)",
+        "metrics": {k: _metric(v) for k, v in series.items()},
+        "series": series,
         "raw_table": q_table,
     }
 
 
 def _is_pdf_extraction_sane(pdf_res: dict[str, Any], sc_ref: dict[str, Any] | None) -> bool:
     """
-    Guards against PDF unit-shift bugs (e.g. Revenue in ₹ Cr but EBITDA/PAT shifted 10x from ₹ Billion/Million).
+    Decides whether to trust the PDF numbers and records why in pdf_res["verification_status"].
+    1. Plausibility: revenue > 0, operating line and PAT present, PAT and (non-financial) EBITDA not above revenue.
+    2. Screener cross-check, only when Screener's latest column is the filing's quarter on the same basis.
+       Right after a filing Screener usually still shows the previous quarter: the PDF is kept as
+       "pdf_only_screener_behind". On a match every metric must agree within SCREENER_MATCH_* tolerance.
+    Returns False only for implausible numbers or a same-quarter mismatch with Screener.
     """
     m = pdf_res.get("metrics") or {}
-    rev = _parse_num((m.get("revenue") or {}).get("value"))
-    ebitda = _parse_num((m.get("ebitda") or {}).get("value"))
-    pat = _parse_num((m.get("pat") or {}).get("value"))
-    if rev is None or rev <= 0 or ebitda is None or pat is None:
-        return False
-
-    # Implausible margin ratio (<2.0% EBITDA margin or >95% EBITDA margin on large revenue, or negative EBITDA with positive PAT)
+    vals = {k: _parse_num((m.get(k) or {}).get("value")) for k in ("revenue", "ebitda", "pbt", "pat")}
+    rev, op, pat = vals["revenue"], vals["ebitda"], vals["pat"]
     if (
-        (ebitda <= 0 and pat > 0)
-        or abs(ebitda) / rev < 0.02
-        or abs(ebitda) / rev > 0.95
-        or abs(pat) / rev < 0.01
+        rev is None
+        or rev <= 0
+        or op is None
+        or pat is None
         or abs(pat) / rev > 0.80
+        or (not pdf_res.get("is_financial") and abs(op) / rev > 0.95)
     ):
+        pdf_res["verification_status"] = "pdf_implausible"
         return False
 
-    # Cross-check order-of-magnitude scale against Screener's standardized ₹ Cr Revenue & PAT
-    # (allow up to ~40% variance across adjacent quarters / standalone vs consolidated, while catching 10x Million/Billion shifts)
-    if sc_ref:
+    # A card without a basis (cached before basis was extracted) can't be compared like-for-like
+    status = _screener_gate(pdf_res.get("quarter_end") or pdf_res.get("period"), pdf_res.get("basis") or "unknown", sc_ref)
+    if status == "match":
         sc_m = sc_ref.get("metrics") or {}
-        sc_rev = _parse_num((sc_m.get("revenue") or {}).get("value"))
-        sc_pat = _parse_num((sc_m.get("pat") or {}).get("value"))
-        for pdf_v, sc_v in ((rev, sc_rev), (pat, sc_pat)):
-            if pdf_v is not None and sc_v is not None and sc_v > 0:
-                ratio = pdf_v / sc_v
-                if ratio < 0.40 or ratio > 2.50:
-                    return False
-
-    return True
+        agrees = all(
+            abs(v - sc_v) <= max(SCREENER_MATCH_ABS_TOL_CR, SCREENER_MATCH_REL_TOL * abs(sc_v))
+            for k, v in vals.items()
+            if v is not None and (sc_v := _parse_num((sc_m.get(k) or {}).get("value"))) is not None
+        )
+        status = "verified_screener" if agrees else "screener_mismatch"
+    pdf_res["verification_status"] = status
+    return status != "screener_mismatch"
 
 
 def enrich_quarterly_results(
@@ -485,10 +726,13 @@ def enrich_quarterly_results(
 ) -> dict[str, Any]:
     """
     Tier 2 (MODEL_FLASH):
-    Extracts Revenue, EBITDA, PBT, and PAT with QoQ and YoY % changes.
-    Cross-checks PDF extraction against Screener's normalized ₹ Cr quarterly table
-    to prevent PDF unit-conversion anomalies (Million/Billion vs Crore), and formats all % deltas consistently.
+    The LLM only copies raw P&L line items from the filing's 3 quarter columns. Python converts units, computes
+    Revenue / EBITDA (or Financing Profit) / PBT / PAT and every QoQ/YoY %, gates the Screener cross-check on
+    quarter + basis (`_is_pdf_extraction_sane`), and checks the takeaway against the computed numbers.
+    Screener's table is the fallback only when its latest column is this filing's quarter.
     """
+    from backend.pull_engine import _filing_quarter  # lazy: pull_engine imports this module
+
     sc_ref: dict[str, Any] | None = None
     try:
         sc_ref = _compute_screener_quarterly_metrics(ticker)
@@ -496,93 +740,73 @@ def enrich_quarterly_results(
         print(f"[llm_router] Screener reference fetch warning for {ticker}: {exc}")
 
     pdf_text = extract_results_pdf_text(pdf_url, max_pages=10) if pdf_url else ""
-    has_usable_pdf = len(pdf_text.strip()) > 600
+    pdf_res: dict[str, Any] | None = None
 
-    if has_usable_pdf:
-        sc_context = ""
-        if sc_ref and sc_ref.get("raw_table"):
-            headers = (sc_ref["raw_table"].get("headers") or [])[-3:]
-            rows_preview = [
-                {k: v for k, v in r.items() if k == "metric" or k in headers}
-                for r in (sc_ref["raw_table"].get("rows") or [])[:8]
-            ]
-            sc_context = (
-                f"\nReference Standardized Quarterly Table (₹ Cr) for {ticker} (use to verify ₹ Cr unit scale "
-                f"or compute QoQ % if the PDF press release only prints Q2 and H1 where Q1 = H1 - Q2):\n"
-                f"{json.dumps(rows_preview, ensure_ascii=False)}\n"
-            )
-
-        prompt_pdf = f"""You are a financial analyst extracting headline quarterly results for {ticker}.
+    if len(pdf_text.strip()) > 600:
+        prompt_pdf = f"""You are copying raw line items from {ticker}'s quarterly financial results filing. Do NOT calculate anything: no EBITDA, no growth %, no unit conversion.
 Filing title: {filing_title}
 
-Extract the Consolidated financial numbers (or Standalone if Consolidated is not present) from the filing text below.
-CRITICAL UNIT RULE: Convert all values to ₹ Crores (₹ Cr) consistently across all 4 rows (1 Billion = 100 Crores, 10 Million = 1 Crore, 100 Lakhs = 1 Crore).
-BANK / NBFC RULE: For Banks or NBFCs (e.g. HDFCBANK, BAJFINANCE), use "Operating Profit before provisions and contingencies (PPOP)" for the "ebitda" field, and "Total Income" for "revenue".
-PRESS RELEASE RULE: If the PDF reports Q2 and H1 (Half-Year) numbers without explicitly printing Q1, derive Q1 = H1 - Q2 (or use the Reference Standardized Quarterly Table below) to compute QoQ %; if PBT is not in the Press Release, use the Reference Table or derive it if available.
-Format QoQ % and YoY % with an explicit leading '+' or '-' sign and trailing '%' (e.g. "+5.8%", "-2.1%").
-Return a JSON object with:
-- "has_numbers": boolean (true ONLY if actual numeric Revenue and PAT for the current quarter are present in the text)
-- "period": string (e.g. "Q2 FY27 (Sep 2026)")
-- "unit": "₹ Cr"
-- "metrics": {{
-    "revenue": {{"value": string, "qoq_pct": string, "yoy_pct": string}},
-    "ebitda":  {{"value": string, "qoq_pct": string, "yoy_pct": string}},
-    "pbt":     {{"value": string, "qoq_pct": string, "yoy_pct": string}},
-    "pat":     {{"value": string, "qoq_pct": string, "yoy_pct": string}}
-  }}
-- "takeaway": 1 concise sentence summarizing topline & bottomline performance (QoQ and YoY).
-{sc_context}
+1. Use the Statement of Profit and Loss. Prefer the CONSOLIDATED statement when the filing has both; use Standalone only if there is no consolidated statement.
+2. Use only the three quarter columns: "current" (latest quarter ended), "previous" (the quarter before it) and "year_ago" (same quarter last year). Ignore half-year, nine-month and full-year columns.
+3. Copy each number exactly as printed, in the table's own unit. Numbers in brackets are negative. Use 0 for a line printed as "-" or blank, and null only when the line does not exist.
+4. Standard / NBFC format (Revenue from operations ... Total expenses) items:
+   revenue_from_operations ("Total revenue from operations", excluding other income), other_income,
+   total_expenses (the "Total expenses" line), finance_costs, depreciation_amortisation,
+   exceptional_items (signed effect on profit: negative for a charge/loss), pbt (profit before tax, after exceptional items),
+   pat (net profit for the period after tax and share of associates/JVs, BEFORE the non-controlling-interest split, not "attributable to owners").
+   Bank format (Interest earned ... Interest expended ... Operating expenses ... Provisions and contingencies) items:
+   interest_earned (total), other_income, interest_expended, operating_expenses (total), provisions (other than tax), exceptional_items, pbt, pat.
+Return a JSON object:
+{{
+  "has_numbers": true only if current-quarter revenue and PAT are in the text,
+  "basis": "Consolidated" or "Standalone",
+  "is_bank_or_nbfc": boolean,
+  "unit_as_printed": one of "crore", "lakh", "million", "billion", "thousand",
+  "quarter_end": month and year the current column ends, e.g. "Sep 2026",
+  "columns": {{"current": {{item: number}}, "previous": {{item: number}}, "year_ago": {{item: number}}}}
+}}
+
 Filing PDF Text:
 {pdf_text[:30000]}
 """
         try:
-            res, served_by = _call_gemini_json_with_model(
+            raw, served_by = _call_gemini_json_with_model(
                 prompt=prompt_pdf,
                 model=MODEL_FLASH,
                 workflow="push_enrich_results_pdf",
                 ticker=ticker,
                 db_path=db_path,
             )
-            if isinstance(res, dict) and res.get("has_numbers") is True and _is_pdf_extraction_sane(res, sc_ref):
-                res["source"] = "Exchange Filing PDF"
-                res["model"] = served_by
-                return _normalize_results_enrichment(res)
+            built = (
+                _results_from_pdf_items(raw, filing_title, sc_ref.get("is_financial") if sc_ref else None)
+                if isinstance(raw, dict) and raw.get("has_numbers") is True
+                else None
+            )
+            if built:
+                pdf_res, series = built
+                if _is_pdf_extraction_sane(pdf_res, sc_ref):
+                    pdf_res.update(source="Exchange Filing PDF", model=served_by)
+                    return _finish_results(ticker, pdf_res, series, db_path)
         except Exception as exc:
-            print(f"[llm_router] PDF results extraction failed for {ticker}, using Screener table: {exc}")
+            print(f"[llm_router] PDF results extraction failed for {ticker}: {exc}")
 
     if not sc_ref:
         return {"has_numbers": False, "error": f"No usable quarterly table for {ticker}"}
-
-    prompt_takeaway = f"""Write a 1-sentence institutional takeaway for {ticker}'s {sc_ref['period']} quarterly results (in ₹ Cr):
-Metrics: {json.dumps(sc_ref['metrics'], ensure_ascii=False)}
-Return JSON: {{"takeaway": "1 concise sentence highlighting Revenue & PAT QoQ/YoY growth and operating margin direction."}}"""
-    takeaway = f"{ticker} reported {sc_ref['period']} Revenue of ₹{sc_ref['metrics']['revenue']['value']} Cr ({sc_ref['metrics']['revenue']['qoq_pct']} QoQ, {sc_ref['metrics']['revenue']['yoy_pct']} YoY) and PAT of ₹{sc_ref['metrics']['pat']['value']} Cr ({sc_ref['metrics']['pat']['qoq_pct']} QoQ, {sc_ref['metrics']['pat']['yoy_pct']} YoY)."
-    takeaway_model: str | None = None  # None = numbers and takeaway are deterministic, no LLM involved
-    try:
-        t_res, served_by = _call_gemini_json_with_model(
-            prompt=prompt_takeaway,
-            model=MODEL_FLASH,
-            workflow="push_enrich_results_fallback",
-            ticker=ticker,
-            db_path=db_path,
-        )
-        if isinstance(t_res, dict) and t_res.get("takeaway"):
-            takeaway = t_res["takeaway"].strip()
-            takeaway_model = served_by
-    except Exception as exc:
-        logger.warning("[llm] results takeaway for %s fell back to template: %s", ticker, _sanitize_log_message(str(exc))[:200])
-
-    return _normalize_results_enrichment(
-        {
-            "has_numbers": True,
-            "period": sc_ref["period"],
-            "unit": "₹ Cr",
-            "source": sc_ref["source"],
-            "metrics": sc_ref["metrics"],
-            "takeaway": takeaway,
-            "model": takeaway_model,
+    # Screener's numbers only stand in for this filing when they are for the same quarter (and basis, if known)
+    quarter = (pdf_res or {}).get("quarter_end") or _filing_quarter(filing_title)
+    gate = _screener_gate(quarter, (pdf_res or {}).get("basis") or None, sc_ref)
+    if gate != "match":
+        return {
+            "has_numbers": False,
+            "verification_status": gate,
+            "error": f"PDF numbers unusable and Screener's latest quarter ({sc_ref['quarter_end']}) is not this filing's",
         }
-    )
+    res = {k: sc_ref[k] for k in ("has_numbers", "quarter_end", "period", "unit", "basis", "is_financial",
+                                  "operating_label", "basis_note", "source", "metrics")}
+    res["verification_status"] = "screener_fallback"
+    out = _finish_results(ticker, res, sc_ref["series"], db_path)
+    out["model"] = out.get("takeaway_model")  # None = numbers and takeaway are deterministic, no LLM involved
+    return out
 
 
 def _search_executive_web(person_name: str, company_name: str) -> list[dict[str, str]]:

@@ -18,6 +18,12 @@ export interface ResultsEnrichment {
     pat?: MetricDelta;
   };
   takeaway?: string;
+  // Added with the computed-metrics format; cards cached before it don't have these
+  summary?: string;
+  basis?: string;
+  operating_label?: string; // "EBITDA" or "Financing Profit" (banks/NBFCs)
+  basis_note?: string; // e.g. "Consolidated • EBITDA ex-other income"
+  verification_status?: string;
 }
 
 export interface ManagementEnrichment {

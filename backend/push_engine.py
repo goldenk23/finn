@@ -76,8 +76,9 @@ def enrich_single_filing(filing_id: str, db_path: Path = DB_PATH) -> dict[str, A
     if enriched:
         with get_conn(db_path) as conn:
             conn.execute(
-                "UPDATE announcements SET enriched_json = ? WHERE filing_id = ?",
-                (json.dumps(enriched, ensure_ascii=False), filing_id),
+                "UPDATE announcements SET enriched_json = ?, summary = COALESCE(?, summary) WHERE filing_id = ?",
+                # results cards carry a numbers-based summary that replaces the generic triage line
+                (json.dumps(enriched, ensure_ascii=False), enriched.get("summary") if cat == "results" else None, filing_id),
             )
     return enriched
 

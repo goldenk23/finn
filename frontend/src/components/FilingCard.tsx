@@ -176,7 +176,7 @@ export function FilingCard({
 
       {/* 1-Line Investor Summary */}
       <p className="mt-2 text-[13px] font-medium leading-snug text-zinc-100">
-        {filing.summary || filing.title}
+        {(filing.category === "results" && enriched?.summary) || filing.summary || filing.title}
       </p>
 
       {!compact && filing.summary && filing.title !== filing.summary && (
@@ -202,6 +202,10 @@ export function FilingCard({
             )}
           </div>
 
+          {enriched.basis_note && (
+            <div className="-mt-1 mb-1.5 text-[10px] font-mono text-zinc-500 truncate">{enriched.basis_note}</div>
+          )}
+
           <div className="grid grid-cols-4 gap-1 text-[10px] font-mono uppercase text-zinc-500 pb-1 border-b border-zinc-800/50">
             <div>Metric</div>
             <div className="text-right">Actual</div>
@@ -213,7 +217,7 @@ export function FilingCard({
             {(
               [
                 ["Revenue", enriched.metrics.revenue],
-                ["EBITDA", enriched.metrics.ebitda],
+                [enriched.operating_label || "EBITDA", enriched.metrics.ebitda],
                 ["PBT", enriched.metrics.pbt],
                 ["PAT", enriched.metrics.pat],
               ] as [string, MetricDelta | undefined][]

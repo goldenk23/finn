@@ -22,6 +22,11 @@ const WORKFLOW_LABELS: Record<string, { label: string; tier: string; badgeCls: s
     tier: "Tier 2",
     badgeCls: "bg-cyan-500/15 text-cyan-300 border-cyan-500/30",
   },
+  push_enrich_results_takeaway: {
+    label: "Push: Results Takeaway (checked against computed numbers)",
+    tier: "Tier 2",
+    badgeCls: "bg-cyan-500/15 text-cyan-300 border-cyan-500/30",
+  },
   push_enrich_results_fallback: {
     label: "Push: Results Primary Table Extraction",
     tier: "Tier 2",

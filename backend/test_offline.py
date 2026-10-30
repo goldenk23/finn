@@ -546,6 +546,212 @@ def test_copilot_sees_notes_and_history_and_cites_only_loaded_docs() -> None:
         main.ask_pull_copilot, main._guard_paid_call = orig_ask, orig_guard
 
 
+# SUNPHARMA Q2 FY27 consolidated P&L as printed (₹ million). Current and previous columns are the real filing;
+# exceptional items are printed positive and subtracted ("PBT (V-VI)"). Year-ago column is built to match Screener.
+SUN_RAW = {
+    "has_numbers": True,
+    "basis": "Consolidated",
+    "is_bank_or_nbfc": False,
+    "unit_as_printed": "₹ in Million",
+    "quarter_end": "Sep 2026",
+    "columns": {
+        "current": {"revenue_from_operations": 161987.1, "other_income": 5173.2, "total_expenses": 122878.3,
+                    "finance_costs": 746.7, "depreciation_amortisation": 7583.4, "exceptional_items": 12688.3,
+                    "pbt": 31593.7, "pat": 19950.7},
+        "previous": {"revenue_from_operations": 152998.8, "other_income": 7236.2, "total_expenses": 117206.0,
+                     "finance_costs": 996.7, "depreciation_amortisation": 7387.2, "exceptional_items": 2040.9,
+                     "pbt": 40988.1, "pat": 29012.3},
+        "year_ago": {"revenue_from_operations": 144780.0, "other_income": 4700.0, "total_expenses": 107810.0,
+                     "finance_costs": 1000.0, "depreciation_amortisation": 7300.0, "exceptional_items": 0,
+                     "pbt": 41670.0, "pat": 31250.0},
+    },
+}
+# Screener's SUNPHARMA consolidated quarterly table (₹ Cr), as scraped on 2026-11-01
+SUN_SCREENER_COLS = ["Jun 2025", "Sep 2025", "Dec 2025", "Mar 2026", "Jun 2026", "Sep 2026"]
+SUN_SCREENER_ROWS = {
+    "Sales": ["13,851", "14,478", "15,521", "14,612", "15,300", "16,199"],
+    "Operating Profit": ["4,302", "4,527", "4,948", "3,954", "4,418", "4,744"],
+    "Profit before tax": ["3,173", "4,168", "4,227", "3,551", "4,099", "3,159"],
+    "Net Profit": ["2,293", "3,125", "3,381", "2,710", "2,901", "1,995"],
+}
+
+
+def _sun_screener(latest: str) -> dict:
+    """Fake fetch_screener_fundamentals output whose latest column is `latest`."""
+    cols = SUN_SCREENER_COLS[: SUN_SCREENER_COLS.index(latest) + 1]
+    rows = [{"metric": name, **dict(zip(SUN_SCREENER_COLS, vals))} for name, vals in SUN_SCREENER_ROWS.items()]
+    return {"screener_url": "https://www.screener.in/company/SUNPHARMA/consolidated/",
+            "quarters": {"headers": cols, "rows": rows}}
+
+
+def test_results_operating_profit_formulas() -> None:
+    op = llm_router._operating_profit
+    # CIPLA Q2 FY27 consolidated (₹ Cr): revenue - total expenses + finance costs + D&A = Screener Operating Profit 1,388
+    cipla = {"revenue_from_operations": 7403.93, "other_income": 151.16, "total_expenses": 6377.75,
+             "finance_costs": 16.74, "depreciation_amortisation": 344.86}
+    assert abs(op(cipla, bank=False, financial=False) - 1387.78) < 0.01, op(cipla, False, False)
+    assert op({**cipla, "other_income": 9999.0}, False, False) == op(cipla, False, False), "other income leaked in"
+    assert op({k: v for k, v in cipla.items() if k != "total_expenses"}, False, False) is None
+    # BAJFINANCE consolidated (Ind AS NBFC): finance costs are its interest cost, so only D&A is added back.
+    # = Screener Financing Profit 8,825 (the old PPOP card showed 10,699, +21%)
+    bfl = {"revenue_from_operations": 24546.37, "other_income": 29.45, "total_expenses": 16042.35,
+           "finance_costs": 8601.73, "depreciation_amortisation": 321.07}
+    assert abs(op(bfl, False, True) - 8825.09) < 0.01, op(bfl, False, True)
+    # Bank (RBI format): interest earned - interest expended - operating expenses - provisions, other income excluded
+    bank = {"interest_earned": 1000.0, "other_income": 300.0, "interest_expended": 550.0,
+            "operating_expenses": 250.0, "provisions": 80.0}
+    assert op(bank, True, True) == 120.0
+    assert op({**bank, "provisions": None}, True, True) is None
+
+    # Bank filing end to end: interest earned is revenue, label is Financing Profit
+    bank_raw = {"basis": "Standalone", "unit_as_printed": "crore", "quarter_end": "Sep 2026",
+                "columns": {"current": {**bank, "pbt": 420.0, "pat": 315.0}, "previous": {}, "year_ago": {}}}
+    res, _ = llm_router._results_from_pdf_items(bank_raw, "results")
+    assert res["metrics"]["revenue"]["value"] == "1,000" and res["metrics"]["ebitda"]["value"] == "120", res["metrics"]
+    assert res["operating_label"] == "Financing Profit" and res["is_financial"] is True
+    assert res["basis_note"] == "Standalone • Financing Profit ex-other income, after provisions"
+
+    # SUNPHARMA in ₹ million: converted to ₹ Cr, exceptional sign reconciled to PBT, EBITDA = Screener's 4,744
+    res, series = llm_router._results_from_pdf_items(SUN_RAW, "Outcome of Board Meeting")
+    m = res["metrics"]
+    assert [m[k]["value"] for k in ("revenue", "ebitda", "pbt", "pat")] == ["16,199", "4,744", "3,159", "1,995"], m
+    assert abs(res["exceptional_items_cr"] + 1268.83) < 0.01, res["exceptional_items_cr"]
+    assert res["period"] == "Q2 FY27 (Sep 2026)" and res["basis_note"] == "Consolidated • EBITDA ex-other income"
+    assert (m["pat"]["qoq_pct"], m["pat"]["yoy_pct"]) == ("-31.2%", "-36.2%"), m["pat"]
+    # No quarter_end from the LLM -> quarter read from the filing title
+    no_q = {**SUN_RAW, "quarter_end": ""}
+    assert llm_router._results_from_pdf_items(no_q, "Results for the quarter ended 30 June 2026")[0]["quarter_end"] == "Jun 2026"
+    assert llm_router._results_from_pdf_items({**SUN_RAW, "unit_as_printed": "units"}, "t") is None
+
+
+def test_results_growth_math() -> None:
+    pc = llm_router._pct_change
+    assert pc(110, 100) == "+10.0%" and pc(90, 100) == "-10.0%"
+    assert pc(-50, 100) == "-150.0%"  # profit to loss off a positive base is still a real change
+    assert pc(50, -100) == "n/a" and pc(-200, -100) == "n/a" and pc(50, 0) == "n/a"  # zero/negative base
+    assert pc(None, 100) == "—" and pc(100, None) == "—"
+    assert llm_router._metric((852.0, 786.0, 1353.0)) == {"value": "852", "qoq_pct": "+8.4%", "yoy_pct": "-37.0%"}
+    assert llm_router._format_pct("n/a") == "n/a" and llm_router._format_pct(None) == "—"  # normalizing keeps n/a
+
+
+def test_results_takeaway_rules() -> None:
+    res, series = llm_router._results_from_pdf_items(SUN_RAW, "t")
+    ok = llm_router._takeaway_ok
+    good = "Revenue rose 11.9% YoY but PAT fell 36.2% YoY, dragged by an exceptional charge of ₹1,269 Cr."
+    assert ok(good, res, series)
+    assert not ok("SUNPHARMA delivered a strong Q2 FY27; exceptional charge of ₹1,269 Cr hit PAT.", res, series)
+    assert not ok("Revenue rose 11.9% YoY while PAT fell 36.2% YoY.", res, series), "exceptional items not mentioned"
+    assert not ok("Exceptional charge of ₹1,269 Cr; PAT fell 40% YoY.", res, series), "a % that wasn't computed"
+    # A quarter where PAT and EBITDA grew may be called strong
+    up = {"metrics": {"revenue": llm_router._metric((110, 100, 100)), "ebitda": llm_router._metric((22, 20, 20)),
+                      "pbt": llm_router._metric((15, 14, 14)), "pat": llm_router._metric((11, 10, 10))}}
+    up_series = {"ebitda": (22, 20, 20), "pat": (11, 10, 10)}
+    assert ok("A strong quarter: PAT up 10.0% QoQ.", up, up_series)
+
+    det = llm_router._deterministic_takeaway("SUNPHARMA", res)
+    assert "PAT ₹1,995 Cr (-31.2% QoQ, -36.2% YoY)" in det and "exceptional charge of ₹1,269 Cr" in det, det
+    assert ok(det, res, series)
+
+    orig = llm_router._call_gemini_json_with_model
+    try:
+        llm_router._call_gemini_json_with_model = lambda **kw: ({"takeaway": "A strong, robust quarter."}, "flash")
+        assert llm_router._results_takeaway("SUNPHARMA", res, series) == (det, None)
+        llm_router._call_gemini_json_with_model = lambda **kw: ({"takeaway": good}, "flash")
+        assert llm_router._results_takeaway("SUNPHARMA", res, series) == (good, "flash")
+    finally:
+        llm_router._call_gemini_json_with_model = orig
+
+
+def test_results_screener_quarter_gate() -> None:
+    orig_fetch = llm_router.fetch_screener_fundamentals
+    try:
+        sc = {}
+        for q in ("Jun 2026", "Sep 2026"):
+            llm_router.fetch_screener_fundamentals = lambda t, q=q: _sun_screener(q)
+            sc[q] = llm_router._compute_screener_quarterly_metrics("SUNPHARMA")
+    finally:
+        llm_router.fetch_screener_fundamentals = orig_fetch
+    assert sc["Sep 2026"]["basis"] == "Consolidated" and sc["Sep 2026"]["period"] == "Q2 FY27 (Sep 2026)"
+
+    def check(sc_ref, **overrides):
+        res = {**llm_router._results_from_pdf_items(SUN_RAW, "t")[0], **overrides}
+        return llm_router._is_pdf_extraction_sane(res, sc_ref), res["verification_status"]
+
+    # Right after the filing Screener still shows Jun 2026: PDF kept, no cross-check against the wrong quarter
+    assert check(sc["Jun 2026"]) == (True, "pdf_only_screener_behind")
+    assert check(sc["Sep 2026"]) == (True, "verified_screener")
+    assert check(None) == (True, "pdf_only_no_screener")
+    assert check({**sc["Sep 2026"], "basis": "Standalone"}) == (True, "pdf_only_basis_mismatch")
+    assert check(sc["Sep 2026"], basis="") == (True, "pdf_only_basis_mismatch")  # card cached before basis existed
+    assert check(sc["Sep 2026"], quarter_end="Jun 2026", period="") == (True, "pdf_only_screener_ahead")
+    # Same quarter: EBITDA incl. other income (old CIPLA card: 1,539 vs Screener 1,388, +11%) is rejected
+    wrong = {"ebitda": {"value": "5,261", "qoq_pct": "", "yoy_pct": ""}}
+    assert check(sc["Sep 2026"], metrics={**sc["Sep 2026"]["metrics"], **wrong}) == (False, "screener_mismatch")
+    within = {"pat": {"value": "2,010", "qoq_pct": "", "yoy_pct": ""}}  # +0.75% vs 1,995: inside the 1% tolerance
+    assert check(sc["Sep 2026"], metrics={**sc["Sep 2026"]["metrics"], **within}) == (True, "verified_screener")
+    implausible = {"pat": {"value": "15,000", "qoq_pct": "", "yoy_pct": ""}}
+    assert check(sc["Sep 2026"], metrics={**sc["Sep 2026"]["metrics"], **implausible}) == (False, "pdf_implausible")
+
+
+def test_results_enrichment_end_to_end() -> None:
+    from backend import push_engine
+
+    pdf_reply: dict = {}
+
+    def fake_llm(**kw):
+        if kw["workflow"] == "push_enrich_results_pdf":
+            return pdf_reply, "gemini-2.5-flash"
+        return {"takeaway": "Sun Pharma delivered a strong Q2 FY27."}, "gemini-2.5-flash"
+
+    names = ("fetch_screener_fundamentals", "extract_results_pdf_text", "_call_gemini_json_with_model")
+    orig = {k: getattr(llm_router, k) for k in names}
+    title = "Outcome of Board Meeting: Unaudited Financial Results for the quarter and half year ended 30 September 2026"
+    try:
+        llm_router.extract_results_pdf_text = lambda url, max_pages=10: "statement of profit and loss " * 40
+        llm_router._call_gemini_json_with_model = fake_llm
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            db = Path(tmp) / "push.db"
+            init_db(db)
+            conn = sqlite3.connect(db)
+            conn.execute(
+                "INSERT INTO announcements (filing_id, ticker, title, published_at, category, materiality, summary, pdf_url)"
+                " VALUES ('r1','SUNPHARMA',?,'2026-10-30 14:15:10','results',1,"
+                "'Unaudited financial results provide key insights into company performance.','https://x/r.pdf')",
+                (title,),
+            )
+            conn.commit()
+            conn.close()
+
+            # Screener still on Jun 2026: PDF numbers kept, hype takeaway replaced, summary rewritten in the DB
+            llm_router.fetch_screener_fundamentals = lambda t: _sun_screener("Jun 2026")
+            pdf_reply.clear()
+            pdf_reply.update(SUN_RAW)
+            out = push_engine.enrich_single_filing("r1", db_path=db)
+            assert out["verification_status"] == "pdf_only_screener_behind" and out["source"] == "Exchange Filing PDF", out
+            assert out["metrics"]["pat"]["value"] == "1,995" and "exceptional charge of ₹1,269 Cr" in out["takeaway"], out
+            assert out["takeaway_model"] is None, "hype takeaway should have been rejected"
+            conn = sqlite3.connect(db)
+            summary = conn.execute("SELECT summary FROM announcements WHERE filing_id='r1'").fetchone()[0]
+            conn.close()
+            assert summary.startswith("Q2 FY27 (Sep 2026) consolidated results: revenue ₹16,199 Cr"), summary
+            assert "PAT ₹1,995 Cr (-31.2% QoQ, -36.2% YoY)" in summary, summary
+
+            # PDF unusable and Screener behind: no fallback to last quarter's numbers
+            pdf_reply.clear()
+            pdf_reply.update(has_numbers=False)
+            out = llm_router.enrich_quarterly_results("SUNPHARMA", title, "https://x/r.pdf", db_path=db)
+            assert out["has_numbers"] is False and out["verification_status"] == "pdf_only_screener_behind", out
+
+            # PDF unusable, Screener on the filing's quarter: Screener numbers with the same definitions
+            llm_router.fetch_screener_fundamentals = lambda t: _sun_screener("Sep 2026")
+            out = llm_router.enrich_quarterly_results("SUNPHARMA", title, "https://x/r.pdf", db_path=db)
+            assert out["verification_status"] == "screener_fallback" and out["metrics"]["ebitda"]["value"] == "4,744", out
+            assert out["basis_note"] == "Consolidated • EBITDA ex-other income" and out["model"] is None
+    finally:
+        for k, v in orig.items():
+            setattr(llm_router, k, v)
+
+
 if __name__ == "__main__":
     tests = [fn for name, fn in sorted(globals().items()) if name.startswith("test_") and callable(fn)]
     for fn in tests:
