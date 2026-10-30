@@ -209,6 +209,11 @@ export interface PullResponse {
   tokens_out: number;
   cost_usd: number;
   created_at?: string;
+  /** Newer results filed, Screener behind the latest filed quarter, or older than 7 days. */
+  stale?: boolean;
+  stale_reason?: string;
+  /** Results are filed but Screener's tables haven't caught up, so a re-run won't help yet. */
+  screener_lag?: boolean;
   eod?: PortfolioItem | null;
   fundamentals: {
     company_name?: string;

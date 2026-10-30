@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import json
 import re
 import threading
@@ -210,6 +210,81 @@ def _quarters_without_prior_call(quarter_headers: list[str], concalls: list[dict
     return out
 
 
+STALE_AFTER_DAYS = 7
+IST_OFFSET = timedelta(hours=5, minutes=30)  # NSE filing timestamps are IST; cache created_at is SQLite UTC
+_QUARTER_END_MONTHS = {"mar": 3, "jun": 6, "sep": 9, "dec": 12}
+
+
+def _filing_quarter(text: str) -> int | None:
+    """Quarter-end month index (year*12 + month) named in a results filing: 'Q2 FY27', 'Q2FY2027', 'quarter ended September 30, 2026'."""
+    low = (text or "").lower()
+    m = re.search(r"\bq([1-4])\s*fy\s*'?(\d{4}|\d{2})\b", low)
+    if m:
+        q, fy = int(m.group(1)), int(m.group(2)) % 100 + 2000
+        return fy * 12 + 3 if q == 4 else (fy - 1) * 12 + 3 + 3 * q  # Q1=Jun, Q2=Sep, Q3=Dec of fy-1; Q4=Mar of fy
+    m = re.search(r"ended\s+(?:on\s+)?(?:\d{1,2}(?:st|nd|rd|th)?\s+)?(mar|jun|sep|dec)[a-z]*\.?\s+(?:\d{1,2}(?:st|nd|rd|th)?,?\s+)?(\d{4})", low)
+    return int(m.group(2)) * 12 + _QUARTER_END_MONTHS[m.group(1)] if m else None
+
+
+def _fiscal_label(idx: int) -> str:
+    """Quarter-end month index -> Indian fiscal label: Jun 2026 -> 'Q1 FY27', Mar 2027 -> 'Q4 FY27'."""
+    year, month = divmod(idx - 1, 12)
+    month += 1
+    fiscal_q = {6: 1, 9: 2, 12: 3, 3: 4}[month]
+    return f"Q{fiscal_q} FY{(year + (month >= 4)) % 100:02d}"
+
+
+def _parse_ts(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value).strip().replace("T", " ")[:19])
+    except ValueError:
+        return None
+
+
+def _report_staleness(
+    ticker: str, quarter_key: str, generated_at: str | None, db_path: Path = DB_PATH, now: datetime | None = None
+) -> dict[str, Any]:
+    """stale / stale_reason / screener_lag for a cached report. Read-only, $0: SQLite + regex, no network or LLM."""
+    now = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    generated = _parse_ts(generated_at) if generated_at else now
+    try:
+        d = datetime.strptime(str(quarter_key).strip()[:8], "%b %Y")
+        report_q = d.year * 12 + d.month
+    except ValueError:
+        report_q = None  # "Latest": Screener had no quarter headers, nothing to compare against
+
+    with get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT title, summary, published_at FROM announcements WHERE ticker = ? AND category = 'results'",
+            (ticker,),
+        ).fetchall()
+
+    newer_quarters, filed_since, latest_q = [], False, None
+    for r in rows:
+        q = _filing_quarter(f"{r['title']} {r['summary'] or ''}")
+        published = _parse_ts(r["published_at"])
+        if generated and published and published - IST_OFFSET > generated:
+            filed_since = True
+            if q:
+                newer_quarters.append(q)
+        if q and (latest_q is None or q > latest_q):
+            latest_q = q
+
+    out = {"stale": False, "stale_reason": "", "screener_lag": False}
+    if filed_since:
+        label = f"{_fiscal_label(max(newer_quarters))} " if newer_quarters else ""
+        out.update(stale=True, stale_reason=f"New {label}results filed since this report was generated")
+    elif latest_q and report_q and latest_q > report_q:
+        out.update(
+            stale=True,
+            screener_lag=True,
+            stale_reason=f"{_fiscal_label(latest_q)} results are filed, but Screener's tables still end at {quarter_key}",
+        )
+    elif generated and now - generated > timedelta(days=STALE_AFTER_DAYS):
+        out.update(stale=True, stale_reason=f"Report is {(now - generated).days} days old (refreshed every {STALE_AFTER_DAYS} days)")
+    return out
+
+
 def get_or_generate_pull_report(
     ticker: str,
     force_refresh: bool = False,
@@ -244,6 +319,7 @@ def get_or_generate_pull_report(
                     "tokens_out": cached["tokens_out"],
                     "cost_usd": cached["cost_usd"],
                     "created_at": cached["created_at"],
+                    **_report_staleness(clean_ticker, cached["quarter_key"], cached["created_at"], db_path),
                     "fundamentals": json.loads(cached["fundamentals_json"]),
                     "report": report,
                 }
@@ -517,6 +593,7 @@ Primary Source Bundle:
             "tokens_in": run_tin,
             "tokens_out": run_tout,
             "cost_usd": run_cost,
+            **_report_staleness(clean_ticker, quarter_key, None, db_path),  # Screener lag shows up right after a re-run
             "fundamentals": fundamentals,
             "report": report,
         }

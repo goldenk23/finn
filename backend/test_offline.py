@@ -428,6 +428,73 @@ def test_quarters_without_prior_call_say_no_guidance() -> None:
             setattr(pull_engine, k, v)
 
 
+def test_pull_report_staleness() -> None:
+    from datetime import datetime
+    from backend import pull_engine
+
+    # Indian fiscal quarters: Q1=Jun, Q2=Sep, Q3=Dec of the prior calendar year, Q4=Mar of the FY year
+    fq = pull_engine._filing_quarter
+    assert [fq(f"Q{q} FY27") for q in (1, 2, 3, 4)] == [2026 * 12 + 6, 2026 * 12 + 9, 2026 * 12 + 12, 2027 * 12 + 3]
+    assert fq('titled "Q2FY27 Financial Results"') == fq("RESULTS FOR Q2 FY2027") == 2026 * 12 + 9
+    for text in ("the quarter ended September 30, 2026", "half-year ended 30th September 2026", "ended 30 Sep 2026"):
+        assert fq(text) == 2026 * 12 + 9, text
+    assert fq("Q2 2026 results") is None and fq("press release dated December 1, 2026") is None
+    assert [pull_engine._fiscal_label(fq(f"Q{q} FY27")) for q in (1, 2, 3, 4)] == ["Q1 FY27", "Q2 FY27", "Q3 FY27", "Q4 FY27"]
+
+    now = datetime(2026, 11, 1, 12, 0, 0)
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        db = Path(tmp) / "stale.db"
+        init_db(db)
+        conn = sqlite3.connect(db)
+        ins = "INSERT INTO announcements (filing_id, ticker, title, published_at, category) VALUES (?,?,?,?,?)"
+        conn.executemany(ins, [
+            # filed 29 Oct 16:21 IST = 10:51 UTC, after a report generated 28 Oct 23:16 UTC
+            ("f1", "ZZNEW", "Results for the second quarter ended 30th September 2026", "2026-10-29 16:21:37", "results"),
+            # names Q2 FY27 but was filed before the report: Screener hadn't caught up when it was generated
+            ("f2", "ZZLAG", 'Press release titled "Q2FY27 Financial Results"', "2026-10-27 13:33:54", "results"),
+            ("f3", "ZZOK", "Results for the quarter ended June 30, 2026", "2026-08-10 15:00:00", "results"),
+            ("f4", "ZZOK", "Q2 FY27 board meeting intimation", "2026-10-30 10:00:00", "board_meeting"),  # not a results row
+        ])
+        conn.commit()
+        conn.close()
+
+        def check(ticker, quarter_key, generated_at):
+            return pull_engine._report_staleness(ticker, quarter_key, generated_at, db, now=now)
+
+        new = check("ZZNEW", "Jun 2026", "2026-10-28 23:16:23")
+        assert new == {"stale": True, "stale_reason": "New Q2 FY27 results filed since this report was generated", "screener_lag": False}, new
+        # 16:21 IST is 10:51 UTC, so a report generated at 11:00 UTC already saw it (and Screener had Sep 2026)
+        assert check("ZZNEW", "Sep 2026", "2026-10-29 11:00:00")["stale"] is False
+        lag = check("ZZLAG", "Jun 2026", "2026-10-30 09:00:00")
+        assert lag["stale"] and lag["screener_lag"] and "Q2 FY27" in lag["stale_reason"] and "Jun 2026" in lag["stale_reason"], lag
+        old = check("ZZOK", "Jun 2026", "2026-10-20 09:00:00")
+        assert old["stale"] and not old["screener_lag"] and "12 days old" in old["stale_reason"], old
+        assert check("ZZOK", "Jun 2026", "2026-10-30 09:00:00") == {"stale": False, "stale_reason": "", "screener_lag": False}
+        assert check("ZZNONE", "Latest", "2026-10-31 09:00:00")["stale"] is False
+
+        # Cached read and re-run both carry the fields; a re-run while Screener still lags stays flagged with that reason
+        fundamentals = {k: {} for k in ("top_ratios", "profit_loss", "balance_sheet", "cash_flow", "ratios")}
+        fundamentals.update(company_name="Lag Co", about="", screener_url="https://x", annual_reports=[], concalls=[],
+                            quarters={"headers": ["Mar 2026", "Jun 2026"]})
+        patches = {
+            "fetch_screener_fundamentals": lambda t: fundamentals,
+            "_get_material_filings": lambda t, d: [],
+            "_extract_primary_documents": lambda f, n: [],
+            "call_gemini_pro_json": lambda **kw: ({}, "pro"),
+        }
+        orig = {k: getattr(pull_engine, k) for k in patches}
+        try:
+            for k, v in patches.items():
+                setattr(pull_engine, k, v)
+            rerun = pull_engine.get_or_generate_pull_report("ZZLAG", force_refresh=True, db_path=db)
+            assert rerun["cached"] is False and rerun["stale"] and rerun["screener_lag"], rerun
+            cached = pull_engine.get_or_generate_pull_report("ZZLAG", db_path=db)
+            assert cached["cached"] is True and cached["screener_lag"] and cached["stale_reason"] == rerun["stale_reason"]
+        finally:
+            for k, v in orig.items():
+                setattr(pull_engine, k, v)
+
+
 def test_copilot_sees_notes_and_history_and_cites_only_loaded_docs() -> None:
     from backend import pull_engine
 

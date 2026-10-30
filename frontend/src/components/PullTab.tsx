@@ -813,8 +813,31 @@ export function PullTab({
   } | null>(null);
   const askReqIdRef = useRef<number>(0);
   const askAbortRef = useRef<AbortController | null>(null);
+  const [rerunning, setRerunning] = useState(false);
+  const [rerunError, setRerunError] = useState<string | null>(null);
+  const activeTickerRef = useRef(activeTicker);
+  activeTickerRef.current = activeTicker;
+
+  // Re-run from the stale banner keeps the old report on screen until the new one is cached, then reloads it ($0).
+  async function handleStaleRerun(ticker: string) {
+    setRerunning(true);
+    setRerunError(null);
+    try {
+      await finnApi.getPullReport(ticker, true);
+      onCostUpdated();
+      if (activeTickerRef.current === ticker) onSelectTicker(ticker, false);
+    } catch (err) {
+      if (activeTickerRef.current === ticker) {
+        setRerunError(err instanceof Error ? err.message : "Re-run failed. Try again.");
+      }
+    } finally {
+      if (activeTickerRef.current === ticker) setRerunning(false);
+    }
+  }
 
   useEffect(() => {
+    setRerunning(false);
+    setRerunError(null);
     askReqIdRef.current += 1;
     if (askAbortRef.current) {
       askAbortRef.current.abort();
@@ -1124,6 +1147,56 @@ export function PullTab({
       {/* Loaded Report Content (strictly guarded to match activeTicker and have no error) */}
       {!loading && !error && isMatchingReport && pullData && report && (
         <>
+          {/* Stale report banner: flagged by the backend, re-run only on an explicit tap */}
+          {pullData.stale && (
+            <div className="rounded-xl border border-amber-500/40 bg-amber-950/25 p-3 space-y-2.5">
+              <div className="flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                <div className="min-w-0 flex-1">
+                  <div className="text-[11px] font-mono font-bold uppercase tracking-wider text-amber-300">
+                    Report may be out of date
+                  </div>
+                  <p className="mt-0.5 text-sm leading-snug text-amber-50 break-words">
+                    {pullData.stale_reason}
+                  </p>
+                  {pullData.screener_lag && (
+                    <p className="mt-1.5 text-xs leading-relaxed text-zinc-300">
+                      Screener&apos;s tables haven&apos;t updated to the new quarter yet, so a re-run now
+                      won&apos;t pick it up. Try again in 1-2 days.
+                    </p>
+                  )}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => handleStaleRerun(pullData.ticker)}
+                disabled={rerunning}
+                className="w-full sm:w-auto min-h-[44px] inline-flex items-center justify-center gap-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/50 px-4 text-sm font-mono font-semibold text-amber-200 transition disabled:opacity-60 disabled:cursor-wait"
+              >
+                {rerunning ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <RefreshCw className="w-4 h-4" />
+                )}
+                <span>
+                  {rerunning
+                    ? "Re-running…"
+                    : `Re-run Report (~$${pullData.cost_usd > 0 ? pullData.cost_usd.toFixed(2) : "0.10"})`}
+                </span>
+              </button>
+              {rerunning && (
+                <p className="text-xs text-zinc-400">
+                  Scraping Screener and filings, then re-synthesizing. This takes 1-2 minutes.
+                </p>
+              )}
+              {rerunError && (
+                <p role="alert" className="rounded-lg border border-rose-500/35 bg-rose-950/40 px-2.5 py-2 text-xs text-rose-300 break-words">
+                  Re-run failed: {rerunError}
+                </p>
+              )}
+            </div>
+          )}
+
           {/* Company Header + Cache/Cost Telemetry + Primary Source Pills */}
           <div
             id="pull-report-overview"
