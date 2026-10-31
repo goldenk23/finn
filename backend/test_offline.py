@@ -428,6 +428,53 @@ def test_quarters_without_prior_call_say_no_guidance() -> None:
             setattr(pull_engine, k, v)
 
 
+def test_pull_amounts_converted_to_crore() -> None:
+    from backend import pull_engine
+
+    # Unit rules: lakhs / 100, million / 10, thousand / 10,000; crore and "lakh crore" are left alone
+    notes = [{"doc_type": "Concall Transcript", "notable_quotes_or_facts": ["Pipeline of Rs. 1 lakh crores", "Capex ₹45 crore"]},
+             {"doc_type": "Annual Report", "related_party_transactions": ["Rs 512 million to JV", "INR 25,000 thousands"]}]
+    assert pull_engine._annotate_crore(notes) == {512.0: 51.2, 25000.0: 2.5}
+    assert notes[0]["notable_quotes_or_facts"] == ["Pipeline of Rs. 1 lakh crores", "Capex ₹45 crore"]
+    assert notes[1]["related_party_transactions"] == ["Rs 512 million (₹51.2 Cr) to JV", "INR 25,000 thousands (₹2.5 Cr)"]
+
+    # End to end, HAL-style: the AR note is in lakhs, the reduce model relabels the lakh total as Cr
+    hal_note = {"doc_id": "D1", "period": "Financial Year 2026", "doc_type": "Annual Report",
+                "contingent_liabilities": ["Claims not acknowledged as debts: Total ₹198456 lakhs (Page 234)"]}
+    fundamentals = {k: {} for k in ("top_ratios", "profit_loss", "cash_flow", "ratios")}
+    fundamentals.update(company_name="Test Co", about="", screener_url="https://x", annual_reports=[], concalls=[],
+                        quarters={"headers": ["Mar 2026"]},
+                        balance_sheet={"headers": ["Mar 2025", "Mar 2026"],
+                                       "rows": [{"metric": "Borrowings", "Mar 2025": "51", "Mar 2026": "66"},
+                                                {"metric": "Total Assets", "Mar 2025": "1,11,997", "Mar 2026": "1,34,395"}]})
+    report = {"balance_sheet": {"summary": "Debt of ₹66 Cr. Contingent liabilities of ₹1,98,456 Cr, an unmodified opinion."},
+              "bull_vs_bear": {"bear_case": ["Tax claims of ₹70,00,000 Cr"]}}
+    prompts = []
+    patches = {
+        "fetch_screener_fundamentals": lambda t: fundamentals,
+        "_get_material_filings": lambda t, db: [],
+        "_extract_primary_documents": lambda f, n: [{"period": "Financial Year 2026", "doc_type": "Annual Report", "url": "https://x/ar.pdf", "text": "ar"}],
+        "_call_gemini_json_with_model": lambda **kw: ([{**hal_note}], "flash"),
+        "call_gemini_pro_json": lambda **kw: (prompts.append(kw["prompt"]) or report, "pro"),
+    }
+    orig = {k: getattr(pull_engine, k) for k in patches}
+    try:
+        for k, v in patches.items():
+            setattr(pull_engine, k, v)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            db = Path(tmp) / "pull.db"
+            init_db(db)
+            out = pull_engine.get_or_generate_pull_report("ZZTESTCO", force_refresh=True, db_path=db)["report"]
+        assert "₹198456 lakhs (₹1,984.56 Cr)" in prompts[0] and "thousand ÷ 10,000" in prompts[0]
+        assert out["document_notes"][0]["contingent_liabilities"] == ["Claims not acknowledged as debts: Total ₹198456 lakhs (₹1,984.56 Cr) (Page 234)"]
+        # Unconverted lakh total fixed; Screener's ₹66 Cr kept; an amount >= 50x total assets (₹1,34,395 Cr) flagged
+        assert out["balance_sheet"]["summary"] == "Debt of ₹66 Cr. Contingent liabilities of ₹1,984.56 Cr, an unmodified opinion.", out
+        assert out["bull_vs_bear"]["bear_case"] == ["Tax claims of ₹70,00,000 Cr (unit unverified)"], out
+    finally:
+        for k, v in orig.items():
+            setattr(pull_engine, k, v)
+
+
 def test_pull_report_staleness() -> None:
     from datetime import datetime
     from backend import pull_engine

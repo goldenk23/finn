@@ -285,6 +285,70 @@ def _report_staleness(
     return out
 
 
+# Divisor to ₹ Cr: 1 Cr = 100 lakh = 10 million = 10,000 thousand. "₹1 lakh crore" is already in Cr, so it is skipped.
+_CR_DIVISOR = {"lakh": 100, "lac": 100, "million": 10, "mn": 10, "thousand": 10_000}
+_SOURCE_AMOUNT_RE = re.compile(
+    r"((?:₹|Rs\.?|INR)\s*(\d[\d,]*(?:\.\d+)?)\s*(lakh|lac|million|mn|thousand)s?\b)(?!\s*(?:crore|cr\b))", re.I
+)
+_CR_AMOUNT_RE = re.compile(r"(?:₹|Rs\.?|INR)\s*(\d[\d,]*(?:\.\d+)?)\s*(?:crores?|cr)\b", re.I)
+
+
+def _num(value: Any) -> float | None:
+    try:
+        return float(str(value).replace(",", "").strip())
+    except ValueError:
+        return None
+
+
+def _cr_text(value: float) -> str:
+    return f"{value:,.2f}".rstrip("0").rstrip(".")
+
+
+def _annotate_crore(notes: list[Any]) -> dict[float, float]:
+    """
+    Append the ₹ Cr value after every lakh / million / thousand amount in the distilled notes, in place
+    ('₹198456 lakhs' -> '₹198456 lakhs (₹1,984.56 Cr)'), so the reduce model never converts units itself.
+    Returns {source amount: ₹ Cr} for the post-reduce check.
+    """
+    source_to_cr: dict[float, float] = {}
+
+    def convert(m: re.Match) -> str:
+        cr = _num(m.group(2)) / _CR_DIVISOR[m.group(3).lower()]
+        source_to_cr[_num(m.group(2))] = cr
+        return f"{m.group(1)} (₹{_cr_text(cr)} Cr)"
+
+    for note in notes:
+        if isinstance(note, dict):
+            for key, val in note.items():
+                if isinstance(val, list):
+                    note[key] = [_SOURCE_AMOUNT_RE.sub(convert, s) if isinstance(s, str) else s for s in val]
+    return source_to_cr
+
+
+def _check_crore_amounts(obj: Any, source_to_cr: dict[float, float], screener_values: set[float], total_assets: float | None) -> Any:
+    """
+    Post-reduce unit check on every '₹X Cr' in the report prose:
+    - X equals a lakh/million/thousand source amount (and is not a Screener table figure): the model relabelled
+      it as Cr, so swap in the converted value (HAL: '₹1,98,456 Cr' -> '₹1,984.56 Cr').
+    - X >= 50x Screener total assets: implausible for any line item, so mark it '(unit unverified)'.
+    """
+    def fix(m: re.Match) -> str:
+        val = _num(m.group(1))
+        if val in source_to_cr and val not in screener_values:
+            return f"₹{_cr_text(source_to_cr[val])} Cr"
+        if total_assets and val >= 50 * total_assets:
+            return f"{m.group(0)} (unit unverified)"
+        return m.group(0)
+
+    if isinstance(obj, str):
+        return _CR_AMOUNT_RE.sub(fix, obj)
+    if isinstance(obj, list):
+        return [_check_crore_amounts(x, source_to_cr, screener_values, total_assets) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _check_crore_amounts(v, source_to_cr, screener_values, total_assets) for k, v in obj.items()}
+    return obj
+
+
 def get_or_generate_pull_report(
     ticker: str,
     force_refresh: bool = False,
@@ -364,7 +428,8 @@ Return a JSON array of objects, one per document, with keys:
 - "stated_guidance_and_promises": list of specific forward-looking claims, growth targets, margin expectations, or execution milestones management stated
 - "segment_and_demand_commentary": list of key operational highlights or headwinds discussed
 - "notable_quotes_or_facts": list of 1-2 verbatim or near-verbatim factual statements with page reference if visible
-For the doc_type "Annual Report" document ONLY, also include these keys (each a list of short factual strings with ₹ amounts and page reference if visible; use [] if the excerpt does not contain it, never guess):
+For the doc_type "Annual Report" document ONLY, also include these keys (each a list of short factual strings with ₹ amounts and page reference if visible; use [] if the excerpt does not contain it, never guess).
+Write every ₹ amount followed by the unit the source states for it, without converting: lakhs, million, crore or thousand (e.g. "₹198456 lakhs", "₹512 million"). Annual Report tables often state the unit once in a header such as "(₹ in lakhs)"; carry that unit onto each amount:
 - "mdna_highlights": business model, industry position, strategy and outlook from Management Discussion & Analysis
 - "segment_performance": each reported segment with its revenue / result numbers
 - "contingent_liabilities": nature and amount of contingent liabilities and claims not acknowledged as debt
@@ -388,6 +453,7 @@ Primary Documents:
 
         # Tie each distilled note to the real document it came from (ID, period, URL) so it can be cached and cited.
         # Falls back to period + doc_type if the model dropped doc_id; notes matching no parsed document are dropped.
+        source_to_cr = _annotate_crore(distilled_notes)  # before the copies below, so cached notes carry ₹ Cr too
         document_notes: list[dict[str, Any]] = []
         for note in distilled_notes:
             if not isinstance(note, dict):
@@ -432,6 +498,7 @@ STRICT DISCIPLINE:
 - NO broker notes, NO news commentary, NO ungrounded outside assumptions.
 - Zero AI slop: write with high information density, sharp institutional judgment, and exact numbers (with ₹ Cr and % units).
 - ANNUAL REPORT EVIDENCE: the `distilled_concall_and_ar_evidence` entry with doc_type "Annual Report" holds audited disclosures. Use its `mdna_highlights` and `segment_performance` for `business_snapshot.overview` and `business_snapshot.segments` (prefer reported segment numbers over inference). In `balance_sheet.summary`, state the contingent liabilities, material related party transactions and the auditor's opinion / key audit matters from it; if no Annual Report entry or field is present, say they were not found in the loaded Annual Report pages instead of guessing.
+- UNITS: write every rupee amount in ₹ Cr. Amounts in `distilled_concall_and_ar_evidence` keep the unit the source used; where a "(₹X Cr)" conversion follows an amount, use that X. Otherwise convert: lakhs ÷ 100, million ÷ 10, thousand ÷ 10,000 (e.g. ₹198,456 lakhs = ₹1,984.56 Cr). Never relabel a lakh, million or thousand figure as Cr.
 - BANKING & NBFC DOMAIN RULE (e.g., HDFCBANK, BAJFINANCE, banks/lenders where Screener reports 'Financing Profit', 'Financing Margin %', or 'Interest' instead of standard manufacturing/services EBITDA):
   1) Map 'Financing Margin %' (or NIM / PPOP margin) into `latest_opm_pct` and `opm_pct` chart fields, and label it clearly in prose.
   2) Do NOT flag high Borrowings / Deposits or high Debt-to-Equity as balance-sheet distress for a Bank or NBFC—deposits and borrowings are their core lending raw material. Instead evaluate Balance Sheet health on Capital Adequacy (CRAR/Tier-1), Asset Quality (GNPA/NNPA, credit costs), Reserves compounding, and ROE/ROA.
@@ -543,6 +610,11 @@ Primary Source Bundle:
             ticker=clean_ticker,
             db_path=db_path,
         )
+        tables = [fundamentals.get(k) or {} for k in ("quarters", "profit_loss", "balance_sheet", "cash_flow", "ratios")]
+        screener_values = {_num(v) for t in tables for row in t.get("rows") or [] for k, v in row.items() if k != "metric"}
+        bs = fundamentals.get("balance_sheet") or {}
+        assets_row = next((r for r in bs.get("rows") or [] if r.get("metric") == "Total Assets"), {})
+        report = _check_crore_amounts(report, source_to_cr, screener_values, _num(assets_row.get((bs.get("headers") or [""])[-1])))
         report["models_used"] = {"map": map_model, "reduce": reduce_model}
         report["document_notes"] = document_notes
         # Enforce the prompt rule: a quarter with no prior call has no guidance to audit against.
