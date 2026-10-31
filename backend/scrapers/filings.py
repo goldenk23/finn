@@ -93,6 +93,9 @@ _AUDITOR_APPOINTMENT = _wb(
 _DEBT_PAPER = _wb(r"non[- ]convertible|ncds?|debentures?|commercial papers?")
 _SUBSIDIARY_SUPPORT = _wb(r"letters? of comfort|comfort letters?|corporate guarantees?|guarantees?|surety")
 _SUBSIDIARY = _wb(r"subsidiar(?:y|ies)")
+# ponytail: the guarantee clause runs to the next comma, semicolon or "and". A guarantee "for loans and NCDs of a
+# subsidiary" leaves "NCDs" behind as a fund_raise; upgrade path is clause parsing in the LLM triage prompt.
+_SUBSIDIARY_SUPPORT_CLAUSE = _wb(r"(?:letters? of comfort|comfort letters?|corporate guarantees?|guarantees?|surety)(?:(?!\band\b)[^,;])*")
 # ponytail: name-based lender check. No offline bank/NBFC helper exists (results enrichment reads Screener's
 # "Financing Profit" row over the network), so this misses lenders without these words in their name (e.g. REC Ltd).
 # Upgrade path: store an is_financial flag on the portfolio row from the Screener scrape.
@@ -132,8 +135,9 @@ def enforce_filing_hygiene(title: str, category: str, materiality: int, is_lende
         return "unclassified", 0
     # Demote an auditor appointment only when it is the whole event. A board outcome that also declares a dividend
     # or appoints a CFO is classified on what is left after the auditor clause is cut out.
-    if category != "results" and _AUDITOR_APPOINTMENT.search(t):
-        rest = _AUDITOR_APPOINTMENT.sub(" ", t)
+    rest = t
+    if category != "results" and _AUDITOR_APPOINTMENT.search(rest):
+        rest = _AUDITOR_APPOINTMENT.sub(" ", rest)
         category, materiality = next(((c, m) for p, c, m in CATEGORY_RULES if p.search(rest)), ("unclassified", 0))
         if not materiality:
             return "unclassified", 0
@@ -141,8 +145,13 @@ def enforce_filing_hygiene(title: str, category: str, materiality: int, is_lende
     # A letter of comfort / guarantee for a subsidiary raises no money from outside investors (ENAM's fund_raise) and
     # moves no money into the subsidiary (ENAM's M&A "investing in a subsidiary"). It is a contingent liability that
     # Pull's balance-sheet module picks up from the annual report, so in the feed it is routine paperwork.
-    if _SUBSIDIARY_SUPPORT.search(t) and _SUBSIDIARY.search(t):
-        return "unclassified", 0
+    # Same as auditors: cut out the guarantee clause (and the bare word "subsidiary", which alone is not an M&A event)
+    # and classify what is left, so a dividend or acquisition filed alongside the guarantee stays material.
+    if category != "results" and _SUBSIDIARY_SUPPORT.search(rest) and _SUBSIDIARY.search(rest):
+        rest = _SUBSIDIARY.sub(" ", _SUBSIDIARY_SUPPORT_CLAUSE.sub(" ", rest))
+        category, materiality = next(((c, m) for p, c, m in CATEGORY_RULES if p.search(rest)), ("unclassified", 0))
+        if not materiality:
+            return "unclassified", 0
 
     # Banks and NBFCs issue NCDs / commercial paper every week as their lending raw material: routine for them.
     # A non-financial company's NCD issue stays a material fund_raise.

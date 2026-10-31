@@ -787,6 +787,10 @@ def test_classifier_rules() -> None:
         "Notice of AGM": ("agm_egm", 0),
         "Notice of Board Meeting": ("unclassified", 0),
         KPIT_COMFORT: ("unclassified", 0),
+        # ...but a results, dividend or acquisition filed with a subsidiary guarantee stays material
+        "Outcome of Board Meeting: approved financial results for Q2 FY27 and corporate guarantee for wholly owned subsidiary": ("results", 1),
+        "Board approved interim dividend of Rs 5 and issue of corporate guarantee for subsidiary": ("dividend", 1),
+        "Acquisition of 100% stake in ABC; corporate guarantee to subsidiary": ("M&A", 1),
         "Post Earnings Conference Call of the Company is scheduled on October 28, 2026": ("earnings_call", 1),
         "Show cause notice received from the GST department": ("litigation", 1),
         "SEBI levied a fine of ₹5 lakh on the Company": ("litigation", 1),
