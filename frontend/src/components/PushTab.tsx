@@ -9,6 +9,7 @@ import {
   Sparkles,
   CheckCircle2,
   Layers,
+  X,
 } from "lucide-react";
 import { DigestResponse, PortfolioItem, PushDataStatus, SourceStatus, TimeWindow } from "@/types/finn";
 import { FilingCard } from "@/components/FilingCard";
@@ -60,6 +61,7 @@ interface PushTabProps {
   onChangeTicker: (t: string | null) => void;
   onRefreshLive: () => void;
   refreshError?: string | null;
+  onDismissRefreshError?: () => void;
   onOpenPull: (ticker: string) => void;
   onFilingEnriched: (filingId: string, enriched: Record<string, unknown>) => void;
 }
@@ -77,6 +79,7 @@ export function PushTab({
   onChangeTicker,
   onRefreshLive,
   refreshError,
+  onDismissRefreshError,
   onOpenPull,
   onFilingEnriched,
 }: PushTabProps) {
@@ -90,7 +93,6 @@ export function PushTab({
   };
   const material = digest?.material || [];
   const routine = digest?.routine || [];
-  const ds = pushDataStatus(digest);
 
   return (
     <div className="space-y-3.5 pb-6">
@@ -117,38 +119,34 @@ export function PushTab({
           type="button"
           onClick={onRefreshLive}
           disabled={refreshing}
-          className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 px-2.5 py-1.5 text-xs font-semibold text-emerald-300 transition disabled:opacity-50"
+          className="inline-flex min-h-11 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 px-2.5 text-xs font-semibold text-emerald-300 transition disabled:opacity-50"
         >
           <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? "animate-spin" : ""}`} />
           <span>{refreshing ? "Scraping NSE/BSE..." : "Refresh Live"}</span>
         </button>
       </div>
       {refreshError && (
-        <p
+        <div
           role="alert"
-          className="-mt-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-[11px] text-amber-300"
+          className="-mt-2 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-300"
         >
-          {refreshError}
-        </p>
+          <p className="min-w-0 flex-1 break-words py-1">{refreshError}</p>
+          {onDismissRefreshError && (
+            <button
+              type="button"
+              aria-label="Dismiss refresh message"
+              onClick={onDismissRefreshError}
+              className="-my-1 -mr-2 shrink-0 rounded-lg p-2 text-amber-300/80 hover:text-amber-200 hover:bg-amber-500/10"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          )}
+        </div>
       )}
 
-      {/* Data freshness + real exchange status */}
-      {digest && (
+      {/* Data-as-of time and exchange status live in the page header (visible on every tab); only the failure and anchor notes are here */}
+      {digest && (digest.last_refresh_error || digest.window_anchor_source === "latest_filing") && (
         <div className="-mt-1.5 space-y-1 px-0.5 text-[11px] font-mono">
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-            <span className={ds.stale ? "text-amber-300" : "text-zinc-400"}>
-              {ds.asOf ? `Data as of ${formatIst(ds.asOf)}` : "Never refreshed"}
-              {ds.asOf && ds.stale ? " • over 12h old" : ""}
-            </span>
-            <span
-              title={ds.detail}
-              className={`rounded px-1.5 py-0.5 ${
-                ds.live ? "bg-emerald-500/10 text-emerald-300" : "bg-zinc-800/80 text-zinc-400"
-              }`}
-            >
-              {ds.label}
-            </span>
-          </div>
           {digest.last_refresh_error && digest.last_refresh_attempt_at && (
             <p className="text-amber-300/90 break-words">
               Last refresh {formatIst(digest.last_refresh_attempt_at)} failed, showing cached data:{" "}
@@ -211,7 +209,7 @@ export function PushTab({
                   {stats.triage_model ? `${stats.triage_model} triage` : "Rule-based triage"}
                 </span>
               </div>
-              <p className="text-[11px] text-zinc-400 mt-0.5">
+              <p className="text-xs text-zinc-400 mt-0.5">
                 <span className="text-emerald-300 font-semibold">
                   {stats.material_count} Material Signals
                 </span>{" "}
@@ -272,7 +270,7 @@ export function PushTab({
                 No material filings in the last {window}
                 {selectedTicker ? ` for ${selectedTicker}` : ""}.
               </p>
-              <p className="text-[11px] text-zinc-400 mt-1">
+              <p className="text-xs text-zinc-400 mt-1">
                 {stats.routine_collapsed_count > 0
                   ? `${stats.routine_collapsed_count} routine exchange notices were automatically filtered out.`
                   : "Exchange feeds are quiet for this window."}
@@ -283,7 +281,7 @@ export function PushTab({
               <button
                 type="button"
                 onClick={() => onChangeWindow("7d")}
-                className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 px-3.5 py-2 text-xs font-bold text-zinc-950 shadow-sm transition"
+                className="inline-flex min-h-11 items-center justify-center gap-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 px-3.5 py-2 text-xs font-bold text-zinc-950 shadow-sm transition"
               >
                 <span>
                   Quiet last {window} across your portfolio — View 7d Material Signals →
@@ -293,7 +291,7 @@ export function PushTab({
               <button
                 type="button"
                 onClick={() => onChangeWindow("14d")}
-                className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/15 hover:bg-emerald-500/25 px-3.5 py-1.5 text-xs font-semibold text-emerald-300 transition"
+                className="inline-flex min-h-11 items-center justify-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/15 hover:bg-emerald-500/25 px-3.5 py-1.5 text-xs font-semibold text-emerald-300 transition"
               >
                 <span>Expand to 14d Material Signals →</span>
               </button>
@@ -325,7 +323,7 @@ export function PushTab({
                 <span className="text-xs font-semibold text-zinc-300">
                   Routine / Low-Relevance Filings ({routine.length} collapsed)
                 </span>
-                <p className="text-[10px] text-zinc-500">
+                <p className="text-xs text-zinc-500">
                   Newspaper ads, loss of share certificates, routine notices, unclassified
                 </p>
               </div>

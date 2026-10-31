@@ -987,14 +987,14 @@ export function PullTab({
                 type="text"
                 value={searchInput}
                 onChange={(e) => setSearchInput(e.target.value)}
-                placeholder="Ticker or company (e.g. Reliance, Eternal, DIXON)..."
-                className="w-full rounded-lg border border-zinc-800 bg-zinc-950 pl-8 pr-3 py-1.5 text-xs text-white placeholder-zinc-500 focus:border-emerald-500 focus:outline-none font-mono"
+                placeholder="Ticker or company"
+                className="w-full rounded-lg border border-zinc-800 bg-zinc-950 pl-8 pr-3 min-h-11 text-base text-white placeholder-zinc-500 focus:border-emerald-500 focus:outline-none font-mono"
               />
             </div>
             <button
               type="submit"
               disabled={!searchInput.trim()}
-              className="rounded-lg bg-emerald-500 hover:bg-emerald-400 px-3 py-1.5 text-xs font-bold text-zinc-950 transition disabled:opacity-50"
+              className="min-h-11 shrink-0 rounded-lg bg-emerald-500 hover:bg-emerald-400 px-3 text-xs font-bold text-zinc-950 transition disabled:opacity-50"
             >
               Analyze
             </button>
@@ -1134,7 +1134,7 @@ export function PullTab({
             <button
               type="button"
               onClick={() => onSelectTicker(activeTicker, false)}
-              className="inline-flex items-center gap-1 rounded bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 px-2 py-1 text-[10px] font-mono text-rose-200 transition"
+              className="inline-flex min-h-11 shrink-0 items-center gap-1 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 px-3 text-xs font-mono text-rose-200 transition"
             >
               <RefreshCw className="w-2.5 h-2.5" />
               <span>Retry</span>
@@ -1283,7 +1283,7 @@ export function PullTab({
               <button
                 type="button"
                 onClick={() => onSelectTicker(pullData.ticker, true)}
-                className="inline-flex items-center gap-1 rounded bg-zinc-800 hover:bg-zinc-700 px-2 py-0.5 text-[10px] font-mono text-zinc-300"
+                className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded bg-zinc-800 hover:bg-zinc-700 px-2 py-0.5 text-[10px] font-mono text-zinc-300"
                 title="Force fresh scrape and Gemini Pro synthesis"
               >
                 <RefreshCw className="w-2.5 h-2.5" />
@@ -1337,12 +1337,12 @@ export function PullTab({
                     <h2 className="text-xs font-extrabold uppercase tracking-wider text-white">
                       Ask {pullData.ticker} Primary-Source Copilot
                     </h2>
-                    <span className="inline-flex items-center gap-1 rounded-full bg-cyan-500/20 border border-cyan-400/35 px-1.5 py-0.5 text-[9px] font-mono font-semibold text-cyan-300">
+                    <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full bg-cyan-500/20 border border-cyan-400/35 px-1.5 py-0.5 text-[9px] font-mono font-semibold text-cyan-300">
                       <span className="h-1.5 w-1.5 rounded-full bg-cyan-400 animate-pulse" />
                       LIVE Q&amp;A
                     </span>
                   </div>
-                  <p className="text-[10.5px] text-zinc-300 mt-0.5">
+                  <p className="text-xs text-zinc-300 mt-0.5">
                     Answers from Screener 10Y &amp; quarterly tables, this report, and distilled notes from the concalls &amp; annual report it parsed. Cites only those sources.
                   </p>
                 </div>
@@ -1364,13 +1364,13 @@ export function PullTab({
                 type="text"
                 value={question}
                 onChange={(e) => setQuestion(e.target.value)}
-                placeholder={`Ask ${pullData.ticker} filings (e.g. "What drove OPM & PAT recently?")...`}
-                className="flex-1 rounded-lg border border-cyan-500/35 bg-zinc-950/95 px-3 py-2 text-xs text-white placeholder-zinc-400 focus:border-cyan-400 focus:outline-none shadow-inner"
+                placeholder={`Ask about ${pullData.ticker}...`}
+                className="flex-1 rounded-lg border border-cyan-500/35 bg-zinc-950/95 px-3 min-h-11 text-base text-white placeholder-zinc-400 focus:border-cyan-400 focus:outline-none shadow-inner"
               />
               <button
                 type="submit"
                 disabled={asking || !question.trim()}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-cyan-400 hover:bg-cyan-300 px-3.5 py-2 text-xs font-extrabold text-zinc-950 shadow-sm transition disabled:opacity-50"
+                className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-lg bg-cyan-400 hover:bg-cyan-300 px-3.5 text-xs font-extrabold text-zinc-950 shadow-sm transition disabled:opacity-50"
               >
                 {asking ? (
                   <>
@@ -1516,7 +1516,7 @@ export function PullTab({
                     <VerdictBadge verdict={q.verdict} />
                   </div>
 
-                  <div className="grid grid-cols-1 gap-2 text-[11.5px]">
+                  <div className="grid grid-cols-1 gap-2 text-xs">
                     <div className="rounded bg-zinc-900/80 p-2 border-l-2 border-purple-400">
                       <div className="text-[10px] font-mono uppercase text-purple-300 font-semibold mb-0.5">
                         Management Narrative / Guidance
@@ -1537,7 +1537,7 @@ export function PullTab({
                   </div>
 
                   {q.audit_note && (
-                    <div className="text-[11px] text-amber-300/95 pt-1 border-t border-zinc-800/60">
+                    <div className="text-xs text-amber-300/95 pt-1 border-t border-zinc-800/60">
                       <span className="font-semibold">Audit Verdict: </span>
                       {renderInlineMarkdown(q.audit_note)}
                     </div>
@@ -1629,11 +1629,11 @@ export function PullTab({
                 {report.business_snapshot.segments.map((seg, i) => (
                   <div
                     key={i}
-                    className="rounded-lg border border-zinc-800/80 bg-zinc-950/70 p-2 text-[11px]"
+                    className="rounded-lg border border-zinc-800/80 bg-zinc-950/70 p-2 text-xs"
                   >
-                    <div className="flex items-center justify-between font-semibold text-zinc-200">
+                    <div className="flex items-start justify-between gap-3 font-semibold text-zinc-200">
                       <span>{seg.name}</span>
-                      <span className="font-mono text-cyan-400 text-[10px]">
+                      <span className="font-mono text-cyan-400 text-xs text-right">
                         {seg.contribution}
                       </span>
                     </div>
@@ -1649,7 +1649,7 @@ export function PullTab({
                 {report.business_snapshot.key_operating_levers.map((lev, i) => (
                   <span
                     key={i}
-                    className="rounded-md bg-zinc-800/90 border border-zinc-700/70 px-2 py-0.5 text-[10px] text-zinc-300"
+                    className="rounded-md bg-zinc-800/90 border border-zinc-700/70 px-2 py-0.5 text-xs text-zinc-300"
                   >
                     ⚡ {renderInlineMarkdown(lev)}
                   </span>
@@ -1730,7 +1730,7 @@ export function PullTab({
                   <TrendingUp className="w-3 h-3" />
                   <span>What&apos;s Expanding / Accelerating</span>
                 </div>
-                <ul className="space-y-1 text-[11px] text-zinc-300 list-disc list-inside">
+                <ul className="space-y-1 text-xs text-zinc-300 list-disc list-inside">
                   {(report.trajectory?.whats_growing || []).map((g, i) => (
                     <li key={i}>{renderInlineMarkdown(g)}</li>
                   ))}
@@ -1742,7 +1742,7 @@ export function PullTab({
                   <TrendingDown className="w-3 h-3" />
                   <span>What&apos;s Compressing / Watchlist</span>
                 </div>
-                <ul className="space-y-1 text-[11px] text-zinc-300 list-disc list-inside">
+                <ul className="space-y-1 text-xs text-zinc-300 list-disc list-inside">
                   {(report.trajectory?.whats_compressing || []).map((c, i) => (
                     <li key={i}>{renderInlineMarkdown(c)}</li>
                   ))}
@@ -1901,7 +1901,7 @@ export function PullTab({
               {(report.guidance?.stated_targets || []).map((t, i) => (
                 <div
                   key={i}
-                  className="rounded-lg border border-zinc-800/90 bg-zinc-950/80 p-2.5 text-[11px]"
+                  className="rounded-lg border border-zinc-800/90 bg-zinc-950/80 p-2.5 text-xs"
                 >
                   <div className="flex items-center justify-between gap-2">
                     <span className="font-semibold text-amber-300">{t.metric}</span>
@@ -1950,7 +1950,7 @@ export function PullTab({
                 <div className="text-[11px] font-mono font-bold uppercase text-emerald-400 mb-1.5">
                   ▲ Bull Case (Data-Backed)
                 </div>
-                <ul className="space-y-1.5 text-[11.5px] text-zinc-200">
+                <ul className="space-y-1.5 text-xs text-zinc-200">
                   {(report.bull_vs_bear?.bull_case || []).map((pt, i) => (
                     <li key={i} className="flex items-start gap-1.5">
                       <span className="text-emerald-400 font-bold">•</span>
@@ -1964,7 +1964,7 @@ export function PullTab({
                 <div className="text-[11px] font-mono font-bold uppercase text-rose-400 mb-1.5">
                   ▼ Bear Case / Key Risks
                 </div>
-                <ul className="space-y-1.5 text-[11.5px] text-zinc-200">
+                <ul className="space-y-1.5 text-xs text-zinc-200">
                   {(report.bull_vs_bear?.bear_case || []).map((pt, i) => (
                     <li key={i} className="flex items-start gap-1.5">
                       <span className="text-rose-400 font-bold">•</span>

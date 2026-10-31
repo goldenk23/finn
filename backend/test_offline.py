@@ -1232,6 +1232,55 @@ def test_failed_refresh_keeps_last_refreshed_at() -> None:
             setattr(push_engine, k, v)
 
 
+def test_one_failed_enrichment_does_not_fail_refresh() -> None:
+    import json
+    from backend import push_engine
+
+    def fake_eod(tickers, db_path=None, save_to_db=True):
+        conn = sqlite3.connect(db_path)
+        conn.execute("INSERT INTO eod_prices (ticker, trade_date, close_price, prev_close, pct_change, volume, avg_volume_20d, "
+                     "volume_ratio) VALUES ('TRENT', '2026-10-30', 4321.5, 4300, 0.5, 1, 1, 1)")
+        conn.commit()
+        conn.close()
+        return [{"ticker": "TRENT"}]
+
+    def fake_filings(ticker, db_path=None, source_status=None, **kw):
+        source_status.update({"NSE": {"status": "ok", "http_code": 200, "message": "3 filings"}})
+        rows = [(f"r{i}", ticker, f"Results Q{i}", f"2026-10-2{i} 10:00:00") for i in (1, 2, 3)]
+        conn = sqlite3.connect(db_path)
+        conn.executemany("INSERT INTO announcements (filing_id, ticker, title, published_at, category, materiality, summary) "
+                         "VALUES (?,?,?,?,'results',1,'s')", rows)
+        conn.commit()
+        conn.close()
+        return rows
+
+    def fake_results(ticker, filing_title, **kw):
+        if filing_title == "Results Q2":
+            raise RuntimeError("Gemini 500")
+        return {"summary": f"ok {filing_title}", "metrics": {}}
+
+    patches = {"fetch_eod_metrics": fake_eod, "fetch_company_filings": fake_filings, "enrich_quarterly_results": fake_results}
+    orig = {k: getattr(push_engine, k) for k in patches}
+    try:
+        for k, v in patches.items():
+            setattr(push_engine, k, v)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            db = Path(tmp) / "enrich.db"
+            init_db(db)
+            out = push_engine.refresh_portfolio_push_data(tickers=["TRENT"], db_path=db)
+            assert out["enrichment_errors"] == 1 and out["filings_deep_enriched"] == 2 and out["refresh_ok"], out
+            conn = sqlite3.connect(db)
+            enriched = dict(conn.execute("SELECT filing_id, enriched_json FROM announcements WHERE ticker = 'TRENT'"))
+            price = conn.execute("SELECT close_price FROM eod_prices WHERE ticker = 'TRENT'").fetchone()
+            conn.close()
+            assert json.loads(enriched["r1"])["summary"] == "ok Results Q1" and json.loads(enriched["r3"])["summary"] == "ok Results Q3"
+            assert enriched["r2"] in (None, "", "{}"), enriched  # failed card stays blank for the next refresh
+            assert price == (4321.5,), price
+    finally:
+        for k, v in orig.items():
+            setattr(push_engine, k, v)
+
+
 def test_filing_source_status_and_bse_fallback() -> None:
     import httpx
     from backend.scrapers import filings

@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import {
   Sliders,
   AlertTriangle,
@@ -13,19 +13,26 @@ import {
   Save,
   BellRing,
   BellOff,
+  X,
 } from "lucide-react";
 import { AlertsResponse, TimeWindow } from "@/types/finn";
 import { FilingCard } from "@/components/FilingCard";
+
+type RulesUpdate = {
+  price_move_pct: number;
+  volume_multiplier: number;
+  watched_categories: string[];
+};
+
+const SLIDER_SAVE_DEBOUNCE_MS = 400;
 
 interface AlertsTabProps {
   alertsData: AlertsResponse | null;
   loading: boolean;
   savingRules: boolean;
-  onUpdateRules: (rules: {
-    price_move_pct: number;
-    volume_multiplier: number;
-    watched_categories: string[];
-  }) => void;
+  rulesError?: string | null;
+  onDismissRulesError?: () => void;
+  onUpdateRules: (rules: RulesUpdate) => void;
   onOpenPull: (ticker: string) => void;
   window: TimeWindow;
   onChangeWindow: (w: TimeWindow) => void;
@@ -78,6 +85,8 @@ export function AlertsTab({
   alertsData,
   loading,
   savingRules,
+  rulesError,
+  onDismissRulesError,
   onUpdateRules,
   onOpenPull,
   window,
@@ -142,7 +151,14 @@ export function AlertsTab({
     "capex",
   ]);
 
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingRulesRef = useRef<RulesUpdate | null>(null);
+  const onUpdateRulesRef = useRef(onUpdateRules);
+  onUpdateRulesRef.current = onUpdateRules;
+
   useEffect(() => {
+    // An older response must not snap the slider back while a newer value waits to be saved
+    if (pendingRulesRef.current) return;
     if (alertsData?.rules) {
       setPricePct(Number(alertsData.rules.price_move_pct ?? 3.0));
       setVolMult(Number(alertsData.rules.volume_multiplier ?? 2.0));
@@ -157,6 +173,7 @@ export function AlertsTab({
       ? watched.filter((c) => c !== catId)
       : [...watched, catId];
     setWatched(next);
+    cancelSliderSave(); // this save already carries the current slider values
     onUpdateRules({
       price_move_pct: pricePct,
       volume_multiplier: volMult,
@@ -164,13 +181,32 @@ export function AlertsTab({
     });
   }
 
-  function handleSliderCommit(nextPrice: number, nextVol: number) {
-    onUpdateRules({
+  // Sliders save 400ms after the last change, so mouse, touch, arrow keys and screen readers all persist
+  // with one request per adjustment. A change still pending when the tab unmounts is saved once, right then.
+  function cancelSliderSave() {
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = null;
+    pendingRulesRef.current = null;
+  }
+
+  function flushSliderSave() {
+    const rules = pendingRulesRef.current;
+    cancelSliderSave();
+    if (rules) onUpdateRulesRef.current(rules);
+  }
+
+  function scheduleSliderSave(nextPrice: number, nextVol: number) {
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    pendingRulesRef.current = {
       price_move_pct: nextPrice,
       volume_multiplier: nextVol,
       watched_categories: watched,
-    });
+    };
+    saveTimerRef.current = setTimeout(flushSliderSave, SLIDER_SAVE_DEBOUNCE_MS);
   }
+
+  // flushSliderSave only touches refs, so the unmount-time copy is never stale
+  useEffect(() => flushSliderSave, []);
 
   const marketAlerts = alertsData?.market_alerts || [];
   const filingAlerts = alertsData?.filing_alerts || [];
@@ -206,7 +242,7 @@ export function AlertsTab({
             Mark all read{newCount > 0 ? ` (${newCount})` : ""}
           </button>
         </div>
-        {notifyNote && <p className="text-[11px] text-amber-400/90">{notifyNote}</p>}
+        {notifyNote && <p className="text-xs text-amber-400/90">{notifyNote}</p>}
       </div>
       {/* Filing alert window (price/volume alerts always use the latest EOD session) */}
       <div className="flex items-center justify-between gap-2">
@@ -245,7 +281,7 @@ export function AlertsTab({
               <h2 className="text-xs font-bold text-white uppercase tracking-wide">
                 Configurable Alert Thresholds
               </h2>
-              <p className="text-[11px] text-zinc-400">
+              <p className="text-xs text-zinc-400">
                 Adjust sliders &amp; category triggers — re-evaluates portfolio live
               </p>
             </div>
@@ -257,6 +293,24 @@ export function AlertsTab({
             </span>
           )}
         </div>
+        {rulesError && (
+          <div
+            role="alert"
+            className="-mt-1 mb-3 flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-300"
+          >
+            <p className="min-w-0 flex-1 break-words py-1">Couldn&apos;t save thresholds: {rulesError}</p>
+            {onDismissRulesError && (
+              <button
+                type="button"
+                aria-label="Dismiss save error"
+                onClick={onDismissRulesError}
+                className="-my-1 -mr-1.5 shrink-0 rounded-lg p-2 text-rose-300/80 hover:text-rose-200 hover:bg-rose-500/10"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+        )}
 
         {/* Sliders for Price Move & Volume Spike */}
         <div className="grid grid-cols-2 gap-3 pt-1">
@@ -273,9 +327,12 @@ export function AlertsTab({
               max={8.0}
               step={0.5}
               value={pricePct}
-              onChange={(e) => setPricePct(parseFloat(e.target.value))}
-              onMouseUp={() => handleSliderCommit(pricePct, volMult)}
-              onTouchEnd={() => handleSliderCommit(pricePct, volMult)}
+              aria-label="EOD price move threshold (%)"
+              onChange={(e) => {
+                const v = parseFloat(e.target.value);
+                setPricePct(v);
+                scheduleSliderSave(v, volMult);
+              }}
               className="mt-2 w-full accent-amber-400 cursor-pointer h-1.5 bg-zinc-800 rounded-lg"
             />
             <div className="flex justify-between text-[9px] font-mono text-zinc-500 mt-1">
@@ -297,9 +354,12 @@ export function AlertsTab({
               max={4.0}
               step={0.2}
               value={volMult}
-              onChange={(e) => setVolMult(parseFloat(e.target.value))}
-              onMouseUp={() => handleSliderCommit(pricePct, volMult)}
-              onTouchEnd={() => handleSliderCommit(pricePct, volMult)}
+              aria-label="Volume spike threshold (x 20-day average)"
+              onChange={(e) => {
+                const v = parseFloat(e.target.value);
+                setVolMult(v);
+                scheduleSliderSave(pricePct, v);
+              }}
               className="mt-2 w-full accent-cyan-400 cursor-pointer h-1.5 bg-zinc-800 rounded-lg"
             />
             <div className="flex justify-between text-[9px] font-mono text-zinc-500 mt-1">

@@ -12,6 +12,7 @@ import {
   Building2,
   ArrowUpRight,
   Loader2,
+  X,
 } from "lucide-react";
 import { FilingItem, MetricDelta } from "@/types/finn";
 import { finnApi } from "@/lib/api";
@@ -142,7 +143,7 @@ export function FilingCard({
   return (
     <div className="rounded-xl border border-zinc-800/90 bg-zinc-900/75 p-3.5 transition hover:border-zinc-700/90">
       {filing.trigger_reason && (
-        <div className="mb-2 flex items-center gap-1.5 rounded-md bg-amber-500/10 border border-amber-500/25 px-2 py-1 text-[11px] font-medium text-amber-300">
+        <div className="mb-2 flex items-center gap-1.5 rounded-md bg-amber-500/10 border border-amber-500/25 px-2 py-1 text-xs font-medium text-amber-300">
           <Sparkles className="w-3 h-3 shrink-0" />
           <span>{filing.trigger_reason}</span>
         </div>
@@ -180,7 +181,7 @@ export function FilingCard({
       </p>
 
       {!compact && filing.summary && filing.title !== filing.summary && (
-        <p className="mt-1 text-[11px] text-zinc-400 line-clamp-1">{filing.title}</p>
+        <p className="mt-1 text-xs text-zinc-400 line-clamp-1">{filing.title}</p>
       )}
 
       {/* HERO CARD 1: Enriched Quarterly Results Table */}
@@ -238,7 +239,7 @@ export function FilingCard({
           </div>
 
           {enriched.takeaway && (
-            <div className="mt-2 pt-2 border-t border-zinc-800/80 text-[11px] text-zinc-300 leading-relaxed">
+            <div className="mt-2 pt-2 border-t border-zinc-800/80 text-xs text-zinc-300 leading-relaxed">
               <span className="font-semibold text-emerald-400">Takeaway: </span>
               {enriched.takeaway}
             </div>
@@ -270,7 +271,7 @@ export function FilingCard({
                     ? enriched.person_name
                     : filing.company_name || filing.ticker}
                 </div>
-                <div className="text-[11px] text-zinc-400">
+                <div className="text-xs text-zinc-400">
                   {enriched.role || "Key Managerial Personnel"}
                 </div>
               </div>
@@ -290,7 +291,7 @@ export function FilingCard({
           </div>
 
           {enriched.two_line_bio && (
-            <p className="mt-2 text-[11.5px] leading-relaxed text-zinc-300 border-t border-zinc-800/80 pt-2">
+            <p className="mt-2 text-xs leading-relaxed text-zinc-300 border-t border-zinc-800/80 pt-2">
               {enriched.two_line_bio}
             </p>
           )}
@@ -358,7 +359,7 @@ export function FilingCard({
               type="button"
               onClick={handleEnrich}
               disabled={enriching}
-              className="inline-flex items-center gap-1 rounded-md bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 px-2 py-1 text-[11px] font-medium text-emerald-300 transition disabled:opacity-50"
+              className="inline-flex min-h-11 items-center gap-1 whitespace-nowrap rounded-md bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 px-2.5 text-xs font-medium text-emerald-300 transition disabled:opacity-50"
             >
               {enriching ? (
                 <Loader2 className="w-3 h-3 animate-spin" />
@@ -367,11 +368,6 @@ export function FilingCard({
               )}
               <span>{enriching ? "Extracting..." : "Deep Enrich"}</span>
             </button>
-          )}
-          {enrichError && (
-            <span role="alert" className="text-[10px] text-amber-300">
-              {enrichError}
-            </span>
           )}
         </div>
 
@@ -384,6 +380,22 @@ export function FilingCard({
           <span>Pull Research</span>
         </button>
       </div>
+      {enrichError && (
+        <div
+          role="alert"
+          className="mt-2 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-xs text-amber-300"
+        >
+          <p className="min-w-0 flex-1 break-words py-1">Enrichment failed: {enrichError}</p>
+          <button
+            type="button"
+            aria-label="Dismiss enrichment error"
+            onClick={() => setEnrichError(null)}
+            className="-my-1 -mr-1.5 shrink-0 rounded-lg p-2 text-amber-300/80 hover:text-amber-200 hover:bg-amber-500/10"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
     </div>
   );
 }

@@ -63,6 +63,7 @@ export default function FinnAppPage() {
   const [alertsData, setAlertsData] = useState<AlertsResponse | null>(null);
   const [alertsLoading, setAlertsLoading] = useState<boolean>(true);
   const [savingRules, setSavingRules] = useState<boolean>(false);
+  const [rulesError, setRulesError] = useState<string | null>(null);
   const [seenIds, setSeenIds] = useState<Set<string> | null>(null);
   // Unseen when the Alerts tab was opened: keeps their NEW pills until the next open or "Mark all read"
   const [openedUnseen, setOpenedUnseen] = useState<Set<string>>(new Set());
@@ -257,12 +258,18 @@ export default function FinnAppPage() {
     try {
       setRefreshingPush(true);
       setRefreshError(null);
-      await finnApi.refreshPush(
+      const res = await finnApi.refreshPush(
         digestTicker ? [digestTicker] : undefined,
         14,
         3,
         digestWindow
       );
+      const failed = res.enrichment_errors || 0;
+      if (failed > 0) {
+        setRefreshError(
+          `Refreshed, but ${failed} ${failed === 1 ? "card" : "cards"} couldn't be enriched. Try Deep Enrich on ${failed === 1 ? "it" : "them"} later.`
+        );
+      }
       await Promise.all([
         loadDigest(digestWindow, digestTicker),
         loadAlerts(alertsWindow),
@@ -283,8 +290,11 @@ export default function FinnAppPage() {
   }) {
     try {
       setSavingRules(true);
+      setRulesError(null);
       await finnApi.updateAlertRules(rules);
       await Promise.all([loadAlerts(alertsWindow), loadPortfolio()]);
+    } catch (err) {
+      setRulesError(err instanceof Error ? err.message : "Couldn't save alert thresholds.");
     } finally {
       setSavingRules(false);
     }
@@ -465,6 +475,7 @@ export default function FinnAppPage() {
               loading={digestLoading}
               refreshing={refreshingPush}
               refreshError={refreshError}
+              onDismissRefreshError={() => setRefreshError(null)}
               window={digestWindow}
               selectedTicker={digestTicker}
               portfolio={portfolio}
@@ -481,6 +492,8 @@ export default function FinnAppPage() {
               alertsData={alertsData}
               loading={alertsLoading}
               savingRules={savingRules}
+              rulesError={rulesError}
+              onDismissRulesError={() => setRulesError(null)}
               onUpdateRules={handleUpdateAlertRules}
               onOpenPull={handleOpenPullFromAnywhere}
               window={alertsWindow}
@@ -522,7 +535,7 @@ export default function FinnAppPage() {
             <button
               type="button"
               onClick={() => setActiveTab("push")}
-              className={`flex flex-col items-center justify-center rounded-xl py-1.5 transition relative ${
+              className={`flex flex-col items-center justify-center min-h-11 rounded-xl py-1.5 transition relative ${
                 activeTab === "push"
                   ? "bg-emerald-500/15 text-emerald-400"
                   : "text-zinc-400 hover:text-zinc-200"
@@ -543,7 +556,7 @@ export default function FinnAppPage() {
               type="button"
               onClick={() => openTab("alerts")}
               aria-label={unseenCount > 0 ? `Alerts, ${unseenCount} new` : "Alerts"}
-              className={`flex flex-col items-center justify-center rounded-xl py-1.5 transition relative ${
+              className={`flex flex-col items-center justify-center min-h-11 rounded-xl py-1.5 transition relative ${
                 activeTab === "alerts"
                   ? "bg-amber-500/15 text-amber-400"
                   : "text-zinc-400 hover:text-zinc-200"
@@ -575,7 +588,7 @@ export default function FinnAppPage() {
             <button
               type="button"
               onClick={() => setActiveTab("pull")}
-              className={`flex flex-col items-center justify-center rounded-xl py-1.5 transition relative ${
+              className={`flex flex-col items-center justify-center min-h-11 rounded-xl py-1.5 transition relative ${
                 activeTab === "pull"
                   ? "bg-cyan-500/15 text-cyan-400"
                   : "text-zinc-400 hover:text-zinc-200"
@@ -583,8 +596,9 @@ export default function FinnAppPage() {
             >
               <div className="relative">
                 <FileSearch className="w-4 h-4" />
-                <span className="absolute -top-1.5 -right-4 rounded-full bg-cyan-400/20 border border-cyan-400/40 px-1 text-[8px] font-mono text-cyan-300">
-                  {activePullTicker.slice(0, 4)}
+                {/* Starts at the icon's right edge so a full ticker fits; only 9+ char tickers get an ellipsis */}
+                <span className="absolute -top-1.5 left-2.5 max-w-[3.25rem] truncate whitespace-nowrap rounded-full bg-cyan-400/20 border border-cyan-400/40 px-1 text-[8px] font-mono text-cyan-300">
+                  {activePullTicker}
                 </span>
               </div>
               <span className="mt-1 text-[10px] font-semibold">Pull Deep</span>
@@ -593,7 +607,7 @@ export default function FinnAppPage() {
             <button
               type="button"
               onClick={() => setActiveTab("portfolio")}
-              className={`flex flex-col items-center justify-center rounded-xl py-1.5 transition relative ${
+              className={`flex flex-col items-center justify-center min-h-11 rounded-xl py-1.5 transition relative ${
                 activeTab === "portfolio"
                   ? "bg-emerald-500/15 text-emerald-400"
                   : "text-zinc-400 hover:text-zinc-200"

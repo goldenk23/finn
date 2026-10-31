@@ -397,11 +397,11 @@ def api_get_digest(
 def api_refresh_push(req: RefreshRequest, request: Request) -> dict[str, Any]:
     _require_admin(request)
     _guard_paid_call(request, "push")
-    stats = refresh_portfolio_push_data(
-        tickers=[_ticker_or_400(t) for t in req.tickers] if req.tickers else None,
-        days=req.days,
-        max_enrich=req.max_enrich,
-    )
+    tickers = [_ticker_or_400(t) for t in req.tickers] if req.tickers else None
+    try:
+        stats = refresh_portfolio_push_data(tickers=tickers, days=req.days, max_enrich=req.max_enrich)
+    except Exception as exc:
+        raise _friendly_upstream_error("Push refresh", exc)
     return {**stats, **get_push_data_status(WINDOW_HOURS.get(req.window, 24))}
 
 
@@ -409,7 +409,10 @@ def api_refresh_push(req: RefreshRequest, request: Request) -> dict[str, Any]:
 def api_enrich_filing(filing_id: str, request: Request) -> dict[str, Any]:
     _require_admin(request)
     _guard_paid_call(request, "push")
-    enriched = enrich_single_filing(filing_id)
+    try:
+        enriched = enrich_single_filing(filing_id)
+    except Exception as exc:
+        raise _friendly_upstream_error("Filing enrichment", exc)
     if not enriched:
         raise HTTPException(status_code=404, detail="Filing not found or not applicable for deep enrichment")
     return {"filing_id": filing_id, "enriched": enriched}

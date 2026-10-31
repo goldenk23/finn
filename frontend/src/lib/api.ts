@@ -14,6 +14,7 @@ import {
 // ponytail: same-origin by default (Next dev rewrite locally, FastAPI-served static export in prod), with direct localhost:8000 fallback if needed.
 // NEXT_PUBLIC_API_URL is the single backend-location env var, also read by next.config.mjs.
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
+const BACKEND_UNREACHABLE = "Cannot reach FINN backend server. Ensure FastAPI is running on port 8000.";
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const fetchInit: RequestInit = {
@@ -32,9 +33,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     if (err instanceof Error && err.name === "AbortError") {
       throw err;
     }
-    throw new Error(
-      "Cannot reach FINN backend server. Ensure FastAPI is running on port 8000."
-    );
+    throw new Error(BACKEND_UNREACHABLE);
   }
 
   // ponytail: if Next.js dev rewrite proxy drops a long-running synthesis with a bare non-JSON 500/502/504 on localhost, transparently retry direct against FastAPI (127.0.0.1:8000).
@@ -53,6 +52,8 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
         if (retryErr instanceof Error && retryErr.name === "AbortError") {
           throw retryErr;
         }
+        // The proxy's bare 500 meant the backend itself is down
+        throw new Error(BACKEND_UNREACHABLE);
       }
     }
   }
@@ -116,6 +117,7 @@ export const finnApi = {
         filings_checked: number;
         filings_triaged_by_llm: number;
         filings_deep_enriched: number;
+        enrichment_errors: number;
         refresh_ok: boolean;
       }
     >("/api/push/refresh", {

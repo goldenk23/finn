@@ -1,4 +1,5 @@
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
@@ -14,11 +15,14 @@ from backend.scrapers.filings import (
     is_vague_title,
 )
 from backend.llm_router import (
+    _sanitize_log_message,
     latest_model_for,
     classify_and_summarize_batch,
     enrich_quarterly_results,
     enrich_management_change,
 )
+
+logger = logging.getLogger("finn.push")
 
 # Exchange timestamps (announcements.published_at) are naive IST, so window maths runs in IST
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -190,9 +194,19 @@ def refresh_portfolio_push_data(
         else:
             to_enrich_rows = []
 
+    # Prices and filings are already committed, so one failed card must not turn the whole refresh into a 500
     enriched_count = 0
+    enrichment_errors = 0
     for row in to_enrich_rows:
-        enriched_data = enrich_single_filing(row["filing_id"], db_path=db_path)
+        try:
+            enriched_data = enrich_single_filing(row["filing_id"], db_path=db_path)
+        except Exception as exc:
+            enrichment_errors += 1
+            logger.warning(
+                "[push] enrichment failed for %s (%s): %s",
+                row["filing_id"], row["ticker"], _sanitize_log_message(f"{type(exc).__name__}: {exc}")[:300],
+            )
+            continue
         if enriched_data:
             enriched_count += 1
 
@@ -203,6 +217,7 @@ def refresh_portfolio_push_data(
         "filings_triaged_by_llm": triage["triaged"],
         "filings_left_untriaged": triage["left"],
         "filings_deep_enriched": enriched_count,
+        "enrichment_errors": enrichment_errors,
         "refresh_ok": refresh_ok,
         "source_status": source_status,
     }

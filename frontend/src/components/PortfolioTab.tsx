@@ -11,6 +11,7 @@ import {
   ArrowUpRight,
   Loader2,
   Briefcase,
+  X,
 } from "lucide-react";
 import { PortfolioItem } from "@/types/finn";
 
@@ -36,6 +37,7 @@ export function PortfolioTab({
   const [adding, setAdding] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
   const [removingTicker, setRemovingTicker] = useState<string | null>(null);
+  const [removeError, setRemoveError] = useState<string | null>(null);
 
   async function handleAdd(e: React.FormEvent) {
     e.preventDefault();
@@ -54,9 +56,13 @@ export function PortfolioTab({
   }
 
   async function handleRemove(ticker: string) {
+    if (!window.confirm(`Remove ${ticker} from your portfolio?`)) return;
     try {
       setRemovingTicker(ticker);
+      setRemoveError(null);
       await onRemoveStock(ticker);
+    } catch (err) {
+      setRemoveError(`Couldn't remove ${ticker}: ${err instanceof Error ? err.message : "request failed."}`);
     } finally {
       setRemovingTicker(null);
     }
@@ -117,13 +123,14 @@ export function PortfolioTab({
           aria-label="NSE ticker to add"
           aria-invalid={addError ? true : undefined}
           aria-describedby={addError ? "add-stock-error" : undefined}
-          placeholder="Add NSE ticker (e.g. DIXON, BEL)..."
-          className="flex-1 rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-1.5 text-xs font-mono text-white placeholder-zinc-500 focus:border-emerald-500 focus:outline-none"
+          placeholder="Add ticker"
+          className="min-w-0 flex-1 min-h-11 rounded-lg border border-zinc-800 bg-zinc-950 px-3 text-base font-mono text-white placeholder-zinc-500 focus:border-emerald-500 focus:outline-none"
         />
         <select
           value={newSector}
           onChange={(e) => setNewSector(e.target.value)}
-          className="rounded-lg border border-zinc-800 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-300 focus:outline-none"
+          aria-label="Sector"
+          className="min-h-11 w-24 rounded-lg border border-zinc-800 bg-zinc-950 px-2 text-base text-zinc-300 focus:outline-none"
         >
           <option value="Equities">Equities</option>
           <option value="IT Services">IT Services</option>
@@ -136,7 +143,7 @@ export function PortfolioTab({
         <button
           type="submit"
           disabled={adding || !newTicker.trim()}
-          className="inline-flex items-center gap-1 rounded-lg bg-emerald-500 hover:bg-emerald-400 px-3 py-1.5 text-xs font-bold text-zinc-950 transition disabled:opacity-50"
+          className="inline-flex min-h-11 shrink-0 items-center gap-1 rounded-lg bg-emerald-500 hover:bg-emerald-400 px-3 text-xs font-bold text-zinc-950 transition disabled:opacity-50"
         >
           {adding ? (
             <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -150,10 +157,26 @@ export function PortfolioTab({
         <p
           id="add-stock-error"
           role="alert"
-          className="-mt-2 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-1.5 text-[11px] text-rose-300"
+          className="-mt-2 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-1.5 text-xs text-rose-300"
         >
           {addError}
         </p>
+      )}
+      {removeError && (
+        <div
+          role="alert"
+          className="-mt-2 flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-1.5 text-xs text-rose-300"
+        >
+          <p className="min-w-0 flex-1 break-words py-1">{removeError}</p>
+          <button
+            type="button"
+            aria-label="Dismiss remove error"
+            onClick={() => setRemoveError(null)}
+            className="-my-1 -mr-2 shrink-0 rounded-lg p-2 text-rose-300/80 hover:text-rose-200 hover:bg-rose-500/10"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
       )}
 
       {/* Dense Institutional Watchlist */}
@@ -275,8 +298,9 @@ export function PortfolioTab({
                     type="button"
                     onClick={() => handleRemove(item.ticker)}
                     disabled={removingTicker === item.ticker}
-                    className="text-zinc-500 hover:text-rose-400 p-1 rounded transition"
+                    className="-my-3 -mr-3 inline-flex h-11 w-11 items-center justify-center text-zinc-500 hover:text-rose-400 rounded-lg transition disabled:opacity-50"
                     title={`Remove ${item.ticker} from portfolio`}
+                    aria-label={`Remove ${item.ticker} from portfolio`}
                   >
                     <Trash2 className="w-3.5 h-3.5" />
                   </button>
