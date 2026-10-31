@@ -82,10 +82,13 @@ _BOARD_MEETING_NOTICE = _wb(
 )
 _OUTCOME = _wb_any(["outcome of board meeting"])
 _IPO_SUBSIDIARY = _wb(r"jio platforms|initial public offer\w*")
-# ENAM puts auditor appointments in `unclassified` (routine paperwork); scrutinizers are AGM/postal ballot admin
+# ENAM puts auditor appointments in `unclassified` (routine paperwork); scrutinizers are AGM/postal ballot admin.
+# Matches only the auditor clause itself: the gap can't cross a comma, semicolon or another "appoint", so in
+# "appointment of Mr. A as CFO and re-appointment of Cost Auditors" only the second clause matches.
 _AUDITOR_APPOINTMENT = _wb(
-    r"(?:re-?)?appoint\w*.*(?:(?:statutory|secretarial|cost|internal)\s+auditors?|scrutini[sz]ers?)"
-    r"|(?:statutory|secretarial|cost|internal)\s+auditors?.*appoint\w*"
+    r"(?:re-?)?appoint\w*(?:(?!appoint)[^,;])*?(?:(?:statutory|secretarial|cost|internal)\s+auditors?|scrutini[sz]ers?)"
+    r"(?:\s+of\s+(?:the\s+)?(?:company|(?:wholly[- ]owned\s+)?subsidiar(?:y|ies)))?"
+    r"|(?:statutory|secretarial|cost|internal)\s+auditors?[\s:–-]*(?:re-?)?appoint\w*"
 )
 _DEBT_PAPER = _wb(r"non[- ]convertible|ncds?|debentures?|commercial papers?")
 _SUBSIDIARY_SUPPORT = _wb(r"letters? of comfort|comfort letters?|corporate guarantees?|guarantees?|surety")
@@ -127,9 +130,13 @@ def enforce_filing_hygiene(title: str, category: str, materiality: int, is_lende
     # 1. Hard routine noise -> always unclassified, materiality=0
     if _ROUTINE_NOISE.search(t):
         return "unclassified", 0
-    # An auditor appointment bundled into a results outcome must not demote the results
+    # Demote an auditor appointment only when it is the whole event. A board outcome that also declares a dividend
+    # or appoints a CFO is classified on what is left after the auditor clause is cut out.
     if category != "results" and _AUDITOR_APPOINTMENT.search(t):
-        return "unclassified", 0
+        rest = _AUDITOR_APPOINTMENT.sub(" ", t)
+        category, materiality = next(((c, m) for p, c, m in CATEGORY_RULES if p.search(rest)), ("unclassified", 0))
+        if not materiality:
+            return "unclassified", 0
 
     # A letter of comfort / guarantee for a subsidiary raises no money from outside investors (ENAM's fund_raise) and
     # moves no money into the subsidiary (ENAM's M&A "investing in a subsidiary"). It is a contingent liability that

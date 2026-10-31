@@ -8,11 +8,15 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 from backend.db import init_db, get_portfolio, get_conn
 from backend.scrapers.filings import enforce_filing_hygiene, is_bank_or_nbfc
-from backend.push_engine import refresh_portfolio_push_data, get_windowed_digest, enrich_single_filing
+from backend.push_engine import (
+    refresh_portfolio_push_data,
+    get_windowed_digest,
+    enrich_single_filing,
+    triage_untriaged_filings,
+)
 from backend.pull_engine import get_or_generate_pull_report
 from backend.llm_router import (
     get_cost_summary,
-    classify_and_summarize_batch,
     _normalize_results_enrichment,
     _is_pdf_extraction_sane,
     _compute_screener_quarterly_metrics,
@@ -52,23 +56,9 @@ def sanitize_and_repair_announcements() -> None:
 
     print(f"[hygiene] Demoted {demoted} routine noise rows (newspaper ads / Reg 74(5) / meet notices) to materiality=0.")
 
-    # Triage any remaining material filings that lack a 1-line summary
-    with get_conn() as conn:
-        untriaged = [
-            dict(r)
-            for r in conn.execute(
-                "SELECT * FROM announcements WHERE materiality = 1 AND (summary IS NULL OR summary = '')"
-            ).fetchall()
-        ]
-    if untriaged:
-        print(f"[hygiene] Generating 1-line summaries for {len(untriaged)} untriaged filings...")
-        t_map = classify_and_summarize_batch(untriaged)
-        with get_conn() as conn:
-            for fid, tdata in t_map.items():
-                conn.execute(
-                    "UPDATE announcements SET category = ?, materiality = ?, summary = ? WHERE filing_id = ?",
-                    (tdata["category"], tdata["materiality"], tdata["summary"], fid),
-                )
+    # Triage every filing that lacks a 1-line summary (routine and Pull-saved rows included), with the same batch caps
+    triage = triage_untriaged_filings()
+    print(f"[hygiene] Triaged {triage['triaged']} filings; {triage['left']} left untriaged.")
 
     # Verify and normalize all material 'results' cards
     with get_conn() as conn:

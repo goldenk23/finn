@@ -816,6 +816,17 @@ def test_classifier_rules() -> None:
     # An auditor appointment inside a results outcome keeps the results material
     both = "Outcome of Board Meeting: financial results for Q2 and appointment of secretarial auditors"
     assert enforce_filing_hygiene(both, "results", 1) == ("results", 1)
+    # ...and a dividend or CFO appointment filed together with an auditor appointment stays material
+    bundled = [
+        ("Board approved interim dividend of Rs 10 per share and appointment of Secretarial Auditors", ("dividend", 1)),
+        ("Appointment of Mr. Rajesh Kumar as Chief Financial Officer and re-appointment of Cost Auditors",
+         ("management_change", 1)),
+    ]
+    for desc, want in bundled:
+        got = classify_heuristic("Outcome of Board Meeting", desc)
+        assert got == want, (desc, got, want)
+    cfo = "Outcome of Board Meeting: appointment of Mr. A as CFO and appointment of internal auditors"
+    assert enforce_filing_hygiene(cfo, "management_change", 1) == ("management_change", 1)
     # Subsidiary IPO filings misread as results are fund raises; matched as whole words ("offering" via offer\w*)
     assert enforce_filing_hygiene("Results of Jio Platforms initial public offering", "results", 1) == ("fund_raise", 1)
 
@@ -913,8 +924,8 @@ def test_triage_loop_covers_all_untriaged_and_stops() -> None:
             batches.clear()
             push_engine.classify_and_summarize_batch = fake_triage
             push_engine.MAX_TRIAGE_BATCHES = 2
-            out = push_engine.refresh_portfolio_push_data(db_path=db)
-            assert batches == [15, 15] and out["filings_left_untriaged"] == 11, (batches, out)
+            out = push_engine.triage_untriaged_filings(db_path=db)  # the entry point warmup_demo.py also uses
+            assert batches == [15, 15] and out == {"triaged": 29, "left": 11}, (batches, out)
         finally:
             for k, v in orig.items():
                 setattr(push_engine, k, v)

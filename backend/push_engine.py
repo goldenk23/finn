@@ -93,6 +93,43 @@ def enrich_single_filing(filing_id: str, db_path: Path = DB_PATH) -> dict[str, A
     return enriched
 
 
+def triage_untriaged_filings(tickers: list[str] | None = None, db_path: Path = DB_PATH) -> dict[str, int]:
+    """Batch-triage every announcement with a blank summary (rows saved by Pull included), or only `tickers`."""
+    with get_conn(db_path) as conn:
+        where = "(summary IS NULL OR summary = '')"
+        params: list[Any] = []
+        if tickers is not None:
+            where += f" AND ticker IN ({','.join('?' for _ in tickers)})"
+            params = list(tickers)
+        untriaged = [
+            dict(r)
+            for r in conn.execute(f"SELECT * FROM announcements WHERE {where} ORDER BY published_at DESC", params)
+        ]
+
+    # Each filing is tried at most once per call; failures stay blank for the next call, and a batch with
+    # no progress (LLM down, budget hit) stops the loop so a failing filing can't keep spending.
+    triaged_count = 0
+    max_rows = MAX_TRIAGE_BATCHES * TRIAGE_BATCH_SIZE
+    for i in range(0, min(len(untriaged), max_rows), TRIAGE_BATCH_SIZE):
+        triaged_map = classify_and_summarize_batch(
+            untriaged[i : i + TRIAGE_BATCH_SIZE], db_path=db_path, batch_size=TRIAGE_BATCH_SIZE
+        )
+        if not triaged_map:
+            break
+        with get_conn(db_path) as conn:
+            for fid, tdata in triaged_map.items():
+                conn.execute(
+                    """
+                    UPDATE announcements
+                    SET category = ?, materiality = ?, summary = ?
+                    WHERE filing_id = ?
+                    """,
+                    (tdata["category"], tdata["materiality"], tdata["summary"], fid),
+                )
+        triaged_count += len(triaged_map)
+    return {"triaged": triaged_count, "left": len(untriaged) - triaged_count}
+
+
 def refresh_portfolio_push_data(
     tickers: list[str] | None = None,
     days: int = 10,
@@ -119,40 +156,8 @@ def refresh_portfolio_push_data(
         items = fetch_company_filings(p["ticker"], bse_code=p["bse_code"], days=days, db_path=db_path, save_to_db=True)
         scraped_count += len(items)
 
-    # Triage every filing with a blank summary, including rows Pull saved for stocks outside the portfolio.
-    # A refresh scoped to `tickers` triages only those stocks.
-    with get_conn(db_path) as conn:
-        where = "(summary IS NULL OR summary = '')"
-        params: list[Any] = []
-        if tickers:
-            where += f" AND ticker IN ({','.join('?' for _ in ticker_list)})"
-            params = ticker_list
-        untriaged = [
-            dict(r)
-            for r in conn.execute(f"SELECT * FROM announcements WHERE {where} ORDER BY published_at DESC", params)
-        ]
-
-    # Each filing is tried at most once per refresh; failures stay blank for the next refresh, and a batch with
-    # no progress (LLM down, budget hit) stops the loop so a failing filing can't keep spending.
-    triaged_count = 0
-    max_rows = MAX_TRIAGE_BATCHES * TRIAGE_BATCH_SIZE
-    for i in range(0, min(len(untriaged), max_rows), TRIAGE_BATCH_SIZE):
-        triaged_map = classify_and_summarize_batch(
-            untriaged[i : i + TRIAGE_BATCH_SIZE], db_path=db_path, batch_size=TRIAGE_BATCH_SIZE
-        )
-        if not triaged_map:
-            break
-        with get_conn(db_path) as conn:
-            for fid, tdata in triaged_map.items():
-                conn.execute(
-                    """
-                    UPDATE announcements
-                    SET category = ?, materiality = ?, summary = ?
-                    WHERE filing_id = ?
-                    """,
-                    (tdata["category"], tdata["materiality"], tdata["summary"], fid),
-                )
-        triaged_count += len(triaged_map)
+    # A refresh scoped to `tickers` triages only those stocks; otherwise every blank row, Pull-saved ones included.
+    triage = triage_untriaged_filings(tickers=ticker_list if tickers else None, db_path=db_path)
 
     # Enrich material 'results' and 'management_change' filings that haven't been enriched yet
     with get_conn(db_path) as conn:
@@ -183,8 +188,8 @@ def refresh_portfolio_push_data(
         "stocks_refreshed": len(ticker_list),
         "eod_updated": len(eod_metrics),
         "filings_checked": scraped_count,
-        "filings_triaged_by_llm": triaged_count,
-        "filings_left_untriaged": len(untriaged) - triaged_count,
+        "filings_triaged_by_llm": triage["triaged"],
+        "filings_left_untriaged": triage["left"],
         "filings_deep_enriched": enriched_count,
     }
 
