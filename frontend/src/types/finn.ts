@@ -71,6 +71,8 @@ export interface FilingItem {
   priority_rank: number;
   enriched?: ResultsEnrichment & ManagementEnrichment & Record<string, unknown>;
   trigger_reason?: string;
+  /** Stable alert IDs from /api/push/alerts ("filing:<id>"); used for unseen tracking. */
+  alert_ids?: string[];
   /** Other exchange filings for the same event, folded into this card by the backend dedup. */
   also_filed_as?: { filing_id: string; title: string; pdf_url?: string; published_at: string }[];
 }
@@ -117,6 +119,8 @@ export interface PortfolioItem {
   material_filings_count?: number;
   has_cached_pull?: boolean;
   trigger_reasons?: string[];
+  /** Market alerts only: one stable ID per triggered rule, "market:<ticker>:<trade_date>:<price|volume>". */
+  alert_ids?: string[];
 }
 
 export interface AlertsResponse extends PushDataStatus {

@@ -539,6 +539,12 @@ def get_triggered_alerts(
             if v_trig:
                 reasons.append(f"Volume {d['volume_ratio']}x 20d avg (threshold {vol_thresh}x)")
             d["trigger_reasons"] = reasons
+            # One stable ID per triggered rule, so a volume breach later on an already-seen price alert counts as new
+            d["alert_ids"] = [
+                f"market:{d['ticker']}:{d['trade_date']}:{rule}"
+                for rule, hit in (("price", p_trig), ("volume", v_trig))
+                if hit
+            ]
             market_alerts.append(d)
 
     raw_filing_alerts: list[dict[str, Any]] = []
@@ -553,6 +559,8 @@ def get_triggered_alerts(
             raw_filing_alerts.append(item)
 
     filing_alerts, _ = _deduplicate_material_filings(raw_filing_alerts)
+    for f in filing_alerts:
+        f["alert_ids"] = [f"filing:{f['filing_id']}"]
 
     return {
         "rules": rules,

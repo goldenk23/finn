@@ -1066,6 +1066,118 @@ def test_window_anchor_uses_last_refresh() -> None:
     assert inspect.signature(main.api_get_digest).parameters["window"].default.default == "24h"
 
 
+def test_eod_alerts_use_completed_session_and_stable_ids() -> None:
+    from datetime import date, datetime, timezone
+    import pandas as pd
+    from backend import push_engine
+    from backend.scrapers import market_data
+
+    done = market_data.is_completed_session
+    utc = lambda *a: datetime(*a, tzinfo=timezone.utc)
+    fri, sat = date(2026, 10, 30), date(2026, 10, 31)
+    assert not done(fri, utc(2026, 10, 30, 8, 30))  # Fri 14:00 IST: today's bar still trading
+    assert done(date(2026, 10, 29), utc(2026, 10, 30, 8, 30))  # yesterday's bar is final
+    assert not done(fri, utc(2026, 10, 30, 10, 0))  # exactly 15:30 IST: not after the close yet
+    assert done(fri, utc(2026, 10, 30, 10, 1))  # 15:31 IST
+    assert done(fri, utc(2026, 10, 31, 5, 30))  # Saturday: Friday's bar is the latest and final
+    # 19:00 UTC Fri = 00:30 IST Sat: IST is already on the 31st, so Friday is final and a "Sat" bar is not
+    assert done(fri, utc(2026, 10, 30, 19, 0)) and not done(sat, utc(2026, 10, 30, 19, 0))
+
+    with _env(FINN_REFRESH_MINUTES=None):
+        assert main._refresh_minutes() == 0
+    for raw, want in (("abc", 0), ("-5", 0), ("0", 0), ("1.5", 0), (" 15 ", 15)):
+        with _env(FINN_REFRESH_MINUTES=raw):
+            assert main._refresh_minutes() == want, raw
+
+    # 21 closed sessions at Rs 100 / 1000 shares, then Fri +5%, then Mon's unfinished bar (-14%, 5x volume so far)
+    days = list(pd.bdate_range("2026-10-01", "2026-10-30")) + [pd.Timestamp("2026-11-02")]
+    closes = [100.0] * (len(days) - 2) + [105.0, 90.0]
+    hist = pd.DataFrame({"Close": closes, "Volume": [1000] * (len(days) - 1) + [5000]}, index=pd.DatetimeIndex(days))
+    orig_yf = market_data.yf
+    market_data.yf = SimpleNamespace(Ticker=lambda sym: SimpleNamespace(history=lambda **kw: hist.copy()))
+    try:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            db = Path(tmp) / "eod.db"
+            init_db(db)  # default rules: 3.0% / 2.0x
+            ins = "INSERT INTO announcements (filing_id, ticker, title, published_at, category, materiality, summary) VALUES (?, 'TRENT', ?, ?, 'results', 1, 's')"
+            conn = sqlite3.connect(db)
+            conn.execute(ins, ("f-77", "Financial results Q2", "2026-10-30 18:00:00"))
+            conn.commit()
+            conn.close()
+
+            # Mon 11:00 IST: the partial bar is dropped, Friday's close is evaluated
+            [m] = market_data.fetch_eod_metrics(["TRENT"], db_path=db, now=utc(2026, 11, 2, 5, 30))
+            assert (m["trade_date"], m["pct_change"], m["volume_ratio"]) == ("2026-10-30", 5.0, 1.0), m
+            alerts = push_engine.get_triggered_alerts("30d", db_path=db)
+            [a] = alerts["market_alerts"]
+            assert a["trade_date"] == "2026-10-30" and a["alert_ids"] == ["market:TRENT:2026-10-30:price"], a
+            assert [f["alert_ids"] for f in alerts["filing_alerts"]] == [["filing:f-77"]]
+            assert push_engine.get_triggered_alerts("30d", db_path=db)["market_alerts"][0]["alert_ids"] == a["alert_ids"]
+
+            # Mon 16:00 IST: the session closed, so Monday's bar now counts and trips both rules
+            [m] = market_data.fetch_eod_metrics(["TRENT"], db_path=db, now=utc(2026, 11, 2, 10, 30))
+            assert m["trade_date"] == "2026-11-02" and m["volume_alert"] and m["price_alert"], m
+            [a] = push_engine.get_triggered_alerts("30d", db_path=db)["market_alerts"]
+            assert a["alert_ids"] == ["market:TRENT:2026-11-02:price", "market:TRENT:2026-11-02:volume"], a
+    finally:
+        market_data.yf = orig_yf
+
+
+def test_background_refresh_skips_overlap_survives_errors_and_cancels() -> None:
+    import asyncio
+    import time
+
+    calls: list[int] = []
+
+    def fake_refresh():
+        calls.append(len(calls))
+        if len(calls) == 2:
+            raise RuntimeError("boom")
+        time.sleep(0.6)
+        return {"ok": True}
+
+    logs: list[str] = []
+    handler = logging.Handler()
+    handler.emit = lambda record: logs.append(record.getMessage())
+    orig_refresh, orig_init = main.refresh_portfolio_push_data, main.init_db
+    main.refresh_portfolio_push_data = fake_refresh
+    main._bg_log.addHandler(handler)
+    main._bg_log.setLevel(logging.INFO)  # uvicorn normally sets INFO on its parent logger
+    try:
+        async def run() -> None:
+            # 0.4 s ticks, 0.6 s runs: run 1 at .4 (to 1.0), skip .8, run 2 at 1.2 fails, run 3 at 1.6, skip 2.0, cancel 2.1
+            task = asyncio.create_task(main._background_refresh_loop(0.4 / 60))
+            await asyncio.sleep(2.1)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            await asyncio.sleep(0.05)
+            pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+            assert pending == [], pending  # the in-flight run 3 was cancelled with the loop
+
+        asyncio.run(run())
+        assert len(calls) == 3, calls
+        assert sum("skipping" in m for m in logs) == 2, logs
+        assert any("cycle failed: RuntimeError: boom" in m for m in logs), logs
+
+        # Lifespan: no loop without the env var; with it, shutdown cancels the sleeping loop promptly
+        main.init_db = lambda *a, **k: None
+        for minutes, enabled in ((None, False), ("1", True)):
+            logs.clear()
+            with _env(FINN_REFRESH_MINUTES=minutes):
+                started = time.monotonic()
+                with TestClient(main.app):
+                    pass
+            assert time.monotonic() - started < 5
+            assert any("enabled: every 1 min" in m for m in logs) == enabled, logs
+    finally:
+        main.refresh_portfolio_push_data, main.init_db = orig_refresh, orig_init
+        main._bg_log.removeHandler(handler)
+        main._bg_log.setLevel(logging.NOTSET)
+
+
 def test_failed_refresh_keeps_last_refreshed_at() -> None:
     from backend import push_engine
     from backend.db import get_meta, set_meta

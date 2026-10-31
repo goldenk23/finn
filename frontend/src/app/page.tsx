@@ -8,24 +8,39 @@ import {
   Briefcase,
   Cpu,
   Terminal,
+  X,
 } from "lucide-react";
 import {
   AlertsResponse,
   CachedReportMeta,
   CostSummaryResponse,
   DigestResponse,
+  FilingItem,
   PortfolioItem,
   PullResponse,
   TimeWindow,
 } from "@/types/finn";
 import { finnApi } from "@/lib/api";
 import { PushTab, formatIst, pushDataStatus } from "@/components/PushTab";
-import { AlertsTab } from "@/components/AlertsTab";
+import { AlertsTab, sendBrowserNotification } from "@/components/AlertsTab";
 import { PullTab } from "@/components/PullTab";
 import { PortfolioTab } from "@/components/PortfolioTab";
 import { CostDrawer } from "@/components/CostDrawer";
 
 type ActiveTab = "push" | "alerts" | "pull" | "portfolio";
+type AlertCard = PortfolioItem | FilingItem;
+
+// Seen alert IDs, stored with the alerts window they were built from
+const SEEN_KEY = "finn.seenAlerts";
+const ALERTS_POLL_MS = 60_000;
+
+function alertCards(data: AlertsResponse | null): AlertCard[] {
+  return data ? [...(data.market_alerts || []), ...(data.filing_alerts || [])] : [];
+}
+
+function alertLabel(a: AlertCard): string {
+  return "title" in a ? `${a.ticker}: ${a.title}` : `${a.ticker}: ${(a.trigger_reasons || []).join(" • ")}`;
+}
 
 export default function FinnAppPage() {
   const [activeTab, setActiveTab] = useState<ActiveTab>("push");
@@ -48,6 +63,11 @@ export default function FinnAppPage() {
   const [alertsData, setAlertsData] = useState<AlertsResponse | null>(null);
   const [alertsLoading, setAlertsLoading] = useState<boolean>(true);
   const [savingRules, setSavingRules] = useState<boolean>(false);
+  const [seenIds, setSeenIds] = useState<Set<string> | null>(null);
+  // Unseen when the Alerts tab was opened: keeps their NEW pills until the next open or "Mark all read"
+  const [openedUnseen, setOpenedUnseen] = useState<Set<string>>(new Set());
+  const [toast, setToast] = useState<{ text: string; more: number; at: number } | null>(null);
+  const knownAlertsRef = useRef<{ window: string; ids: Set<string> } | null>(null);
 
   // Pull Research state
   const [activePullTicker, setActivePullTicker] = useState<string>("TRENT");
@@ -104,15 +124,25 @@ export default function FinnAppPage() {
     []
   );
 
-  const loadAlerts = useCallback(async (win: TimeWindow) => {
+  // quiet: background poll, no loading skeleton
+  const loadAlerts = useCallback(async (win: TimeWindow, quiet = false) => {
     try {
-      setAlertsLoading(true);
+      if (!quiet) setAlertsLoading(true);
       const res = await finnApi.getAlerts(win);
       setAlertsData(res);
     } catch {
       // ignore
     } finally {
-      setAlertsLoading(false);
+      if (!quiet) setAlertsLoading(false);
+    }
+  }, []);
+
+  const saveSeen = useCallback((win: string, ids: Set<string>) => {
+    setSeenIds(ids);
+    try {
+      localStorage.setItem(SEEN_KEY, JSON.stringify({ window: win, ids: Array.from(ids) }));
+    } catch {
+      // storage full or disabled: unseen tracking lasts for this page view only
     }
   }, []);
 
@@ -168,6 +198,56 @@ export default function FinnAppPage() {
   useEffect(() => {
     loadAlerts(alertsWindow);
   }, [alertsWindow, loadAlerts]);
+
+  // /api/push/alerts only reads SQLite (no scraping, no LLM), so polling costs nothing. Paused while the tab is hidden.
+  useEffect(() => {
+    const poll = () => {
+      if (document.visibilityState === "visible") void loadAlerts(alertsWindow, true);
+    };
+    const timer = setInterval(poll, ALERTS_POLL_MS);
+    document.addEventListener("visibilitychange", poll); // catch up as soon as the tab is visible again
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", poll);
+    };
+  }, [alertsWindow, loadAlerts]);
+
+  // Unseen tracking: update the seen set from each alerts response and announce alerts that just appeared
+  useEffect(() => {
+    if (!alertsData) return;
+    const cards = alertCards(alertsData);
+    const current = new Set(cards.flatMap((c) => c.alert_ids || []));
+    let stored: { window: string; ids: string[] } | null = null;
+    try {
+      stored = JSON.parse(localStorage.getItem(SEEN_KEY) || "null");
+    } catch {
+      stored = null;
+    }
+    // First visit, or a set built from another window: start with everything seen so old alerts don't all show NEW.
+    // Otherwise drop stored IDs that left the response so the set stays small.
+    const seen =
+      !stored || stored.window !== alertsData.window || !Array.isArray(stored.ids)
+        ? current
+        : new Set(stored.ids.filter((id) => current.has(id)));
+
+    const prev = knownAlertsRef.current;
+    knownAlertsRef.current = { window: alertsData.window, ids: current };
+    if (prev && prev.window === alertsData.window) {
+      const fresh = cards.filter((c) => (c.alert_ids || []).some((id) => !prev.ids.has(id) && !seen.has(id)));
+      if (fresh.length > 0) {
+        const text = alertLabel(fresh[0]);
+        setToast({ text, more: fresh.length - 1, at: Date.now() });
+        sendBrowserNotification(fresh.length > 1 ? `${text} (+${fresh.length - 1} more)` : text);
+      }
+    }
+    saveSeen(alertsData.window, seen);
+  }, [alertsData, saveSeen]);
+
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 8000);
+    return () => clearTimeout(t);
+  }, [toast]);
 
   useEffect(() => {
     loadDigest(digestWindow, digestTicker);
@@ -256,10 +336,68 @@ export default function FinnAppPage() {
   const totalAlerts = alertsData?.total_alerts || 0;
   const dataStatus = pushDataStatus(digest);
 
+  const cards = alertCards(alertsData);
+  const allAlertIds = cards.flatMap((c) => c.alert_ids || []);
+  const unseenIds = seenIds ? allAlertIds.filter((id) => !seenIds.has(id)) : [];
+  const unseenCount = seenIds ? cards.filter((c) => (c.alert_ids || []).some((id) => !seenIds.has(id))).length : 0;
+  const newAlertIds = new Set([...unseenIds, ...Array.from(openedUnseen)]);
+
+  function markAllAlertsSeen() {
+    if (alertsData) saveSeen(alertsData.window, new Set(allAlertIds));
+  }
+
+  function openTab(tab: ActiveTab) {
+    if (tab === "alerts" && activeTab !== "alerts") {
+      // Opening the tab marks everything seen and clears the badge; the NEW pills stay while you look
+      setOpenedUnseen(new Set(unseenIds));
+      markAllAlertsSeen();
+    }
+    setActiveTab(tab);
+  }
+
+  function handleMarkAllRead() {
+    setOpenedUnseen(new Set());
+    markAllAlertsSeen();
+  }
+
   return (
     <div className="min-h-screen w-full bg-[#050507] flex justify-center">
       {/* Mobile-First Institutional Shell (430px max width on desktop, 100% on phone) */}
       <div className="w-full max-w-[430px] min-h-screen flex flex-col border-x border-zinc-800/80 bg-zinc-950 shadow-2xl relative">
+        {/* New-alert banner: top of screen, auto-hides after 8s */}
+        {toast && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="fixed top-2 left-1/2 -translate-x-1/2 z-50 w-[calc(100%-1rem)] max-w-[414px] flex items-start gap-2 rounded-xl border border-rose-500/50 bg-zinc-900/95 backdrop-blur-md p-2.5 shadow-2xl"
+          >
+            <button
+              type="button"
+              onClick={() => {
+                setToast(null);
+                openTab("alerts");
+              }}
+              className="flex min-w-0 flex-1 items-start gap-2 text-left"
+            >
+              <Bell className="mt-0.5 w-4 h-4 shrink-0 text-rose-400" />
+              <span className="min-w-0">
+                <span className="block text-[11px] font-black uppercase tracking-wide text-rose-300">
+                  New alert{toast.more > 0 ? ` (+${toast.more} more)` : ""}
+                </span>
+                <span className="block text-xs text-zinc-200 line-clamp-2">{toast.text}</span>
+              </span>
+            </button>
+            <button
+              type="button"
+              aria-label="Dismiss alert banner"
+              onClick={() => setToast(null)}
+              className="shrink-0 -m-1 p-2 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+
         {/* Sticky Top Header */}
         <header className="sticky top-0 z-30 border-b border-zinc-800/90 bg-zinc-950/90 backdrop-blur-md px-3.5 py-2.5 flex items-center justify-between gap-2">
           <div className="flex items-center gap-2 min-w-0">
@@ -347,6 +485,8 @@ export default function FinnAppPage() {
               onOpenPull={handleOpenPullFromAnywhere}
               window={alertsWindow}
               onChangeWindow={setAlertsWindow}
+              newAlertIds={newAlertIds}
+              onMarkAllRead={handleMarkAllRead}
             />
           )}
 
@@ -401,7 +541,8 @@ export default function FinnAppPage() {
 
             <button
               type="button"
-              onClick={() => setActiveTab("alerts")}
+              onClick={() => openTab("alerts")}
+              aria-label={unseenCount > 0 ? `Alerts, ${unseenCount} new` : "Alerts"}
               className={`flex flex-col items-center justify-center rounded-xl py-1.5 transition relative ${
                 activeTab === "alerts"
                   ? "bg-amber-500/15 text-amber-400"
@@ -410,10 +551,22 @@ export default function FinnAppPage() {
             >
               <div className="relative">
                 <Bell className="w-4 h-4" />
-                {totalAlerts > 0 && (
-                  <span className="absolute -top-1.5 -right-3 rounded-full bg-amber-400 px-1 text-[9px] font-mono font-bold text-zinc-950">
-                    {totalAlerts}
+                {unseenCount > 0 ? (
+                  <span
+                    data-badge="unseen"
+                    className="absolute -top-2 -right-3.5 rounded-full bg-rose-500 px-1.5 text-[10px] font-mono font-black text-white ring-2 ring-zinc-950 shadow-[0_0_8px_rgba(244,63,94,0.8)]"
+                  >
+                    {unseenCount}
                   </span>
+                ) : (
+                  totalAlerts > 0 && (
+                    <span
+                      data-badge="total"
+                      className="absolute -top-1.5 -right-3 rounded-full bg-zinc-800 px-1 text-[9px] font-mono text-zinc-400"
+                    >
+                      {totalAlerts}
+                    </span>
+                  )
                 )}
               </div>
               <span className="mt-1 text-[10px] font-semibold">Alerts</span>

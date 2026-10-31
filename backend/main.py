@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 import hmac
 import json
 import logging
@@ -16,6 +18,8 @@ from pydantic import BaseModel, Field
 from backend.llm_router import _sanitize_log_message  # shared with the LLM fallback warnings
 
 logger = logging.getLogger("finn.api")
+# Child of uvicorn's logger so background-refresh INFO lines show in the server log (the app sets up no handlers)
+_bg_log = logging.getLogger("uvicorn.error.bg_refresh")
 
 
 def _friendly_upstream_error(context: str, exc: Exception) -> HTTPException:
@@ -185,10 +189,56 @@ def _is_pull_cached(ticker: str) -> bool:
         return conn.execute("SELECT 1 FROM pull_reports_cache WHERE ticker = ?", (ticker,)).fetchone() is not None
 
 
+def _refresh_minutes() -> int:
+    """FINN_REFRESH_MINUTES as a positive int; 0 (off) when unset or invalid."""
+    try:
+        return max(int(os.getenv("FINN_REFRESH_MINUTES", "").strip()), 0)
+    except ValueError:
+        return 0
+
+
+async def _run_background_refresh(lock: asyncio.Lock) -> None:
+    async with lock:
+        started = time.monotonic()
+        _bg_log.info("[bg-refresh] cycle started")
+        try:
+            stats = await asyncio.to_thread(refresh_portfolio_push_data)
+            _bg_log.info("[bg-refresh] cycle done in %.0fs: %s", time.monotonic() - started, stats)
+        except Exception as exc:
+            _bg_log.error("[bg-refresh] cycle failed: %s", _sanitize_log_message(f"{type(exc).__name__}: {exc}"))
+
+
+async def _background_refresh_loop(minutes: int) -> None:
+    """Every `minutes`, start a Push refresh in a thread. A cycle that finds the previous run still going is skipped."""
+    # ponytail: every uvicorn worker process starts its own loop, so this suits a single-worker deployment.
+    # Upgrade path: an external scheduler (cron / Cloud Scheduler calling /api/push/refresh) or a DB lock row.
+    lock = asyncio.Lock()
+    run: asyncio.Task | None = None
+    try:
+        while True:
+            await asyncio.sleep(minutes * 60)
+            if lock.locked():
+                _bg_log.warning("[bg-refresh] previous cycle still running, skipping this one")
+                continue
+            run = asyncio.create_task(_run_background_refresh(lock))
+    finally:
+        # Shutdown: stop waiting on the in-flight run. Its worker thread can't be interrupted and finishes on its own.
+        if run and not run.done():
+            run.cancel()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    minutes = _refresh_minutes()
+    task = asyncio.create_task(_background_refresh_loop(minutes)) if minutes else None
+    if task:
+        _bg_log.info("[bg-refresh] enabled: every %d min", minutes)
     yield
+    if task:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 app = FastAPI(

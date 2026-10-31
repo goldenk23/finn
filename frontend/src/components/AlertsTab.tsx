@@ -9,7 +9,10 @@ import {
   TrendingDown,
   ArrowUpRight,
   Check,
+  CheckCheck,
   Save,
+  BellRing,
+  BellOff,
 } from "lucide-react";
 import { AlertsResponse, TimeWindow } from "@/types/finn";
 import { FilingCard } from "@/components/FilingCard";
@@ -26,6 +29,34 @@ interface AlertsTabProps {
   onOpenPull: (ticker: string) => void;
   window: TimeWindow;
   onChangeWindow: (w: TimeWindow) => void;
+  /** Alert IDs that get a NEW pill (unseen, or unseen when the tab was opened). */
+  newAlertIds: Set<string>;
+  onMarkAllRead: () => void;
+}
+
+const NOTIFY_KEY = "finn.browserNotifications";
+
+/** Fires a system notification if the user enabled it here and the browser granted permission. */
+export function sendBrowserNotification(body: string) {
+  if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
+  if (localStorage.getItem(NOTIFY_KEY) !== "1") return;
+  try {
+    new Notification("FINN alert", { body, tag: "finn-alert" });
+  } catch {
+    // Android Chrome only allows notifications from a service worker; the in-app toast still shows
+  }
+}
+
+export function isNewAlert(ids: string[] | undefined, newAlertIds: Set<string>) {
+  return (ids || []).some((id) => newAlertIds.has(id));
+}
+
+function NewPill() {
+  return (
+    <span className="absolute -top-2 right-2 z-10 rounded-full bg-rose-500 px-1.5 py-0.5 text-[10px] font-mono font-black text-white shadow">
+      NEW
+    </span>
+  );
 }
 
 const ALERT_WINDOWS: TimeWindow[] = ["24h", "3d", "7d", "14d", "30d"];
@@ -51,7 +82,55 @@ export function AlertsTab({
   onOpenPull,
   window,
   onChangeWindow,
+  newAlertIds,
+  onMarkAllRead,
 }: AlertsTabProps) {
+  const [notifyOn, setNotifyOn] = useState<boolean>(false);
+  const [notifyNote, setNotifyNote] = useState<string | null>(null);
+  const [notifySupported, setNotifySupported] = useState<boolean>(true);
+
+  useEffect(() => {
+    if (typeof Notification === "undefined") {
+      setNotifySupported(false);
+      setNotifyNote("Browser notifications aren't supported here.");
+      return;
+    }
+    const on = localStorage.getItem(NOTIFY_KEY) === "1";
+    setNotifyOn(on && Notification.permission === "granted");
+    if (on && Notification.permission === "denied") setNotifyNote("Blocked in browser settings.");
+  }, []);
+
+  // Asks for permission only from this click, never on page load
+  async function toggleNotifications() {
+    if (typeof Notification === "undefined") return;
+    if (notifyOn) {
+      localStorage.setItem(NOTIFY_KEY, "0");
+      setNotifyOn(false);
+      setNotifyNote(null);
+      return;
+    }
+    let perm = Notification.permission;
+    if (perm === "default") {
+      try {
+        perm = await Notification.requestPermission();
+      } catch {
+        perm = "denied";
+      }
+    }
+    if (perm === "granted") {
+      localStorage.setItem(NOTIFY_KEY, "1");
+      setNotifyOn(true);
+      setNotifyNote(null);
+    } else {
+      localStorage.setItem(NOTIFY_KEY, "0");
+      setNotifyNote(
+        perm === "denied"
+          ? "Blocked in browser settings. In-app banners still show."
+          : "Permission not granted. In-app banners still show."
+      );
+    }
+  }
+
   const [pricePct, setPricePct] = useState<number>(3.0);
   const [volMult, setVolMult] = useState<number>(2.0);
   const [watched, setWatched] = useState<string[]>([
@@ -95,9 +174,40 @@ export function AlertsTab({
 
   const marketAlerts = alertsData?.market_alerts || [];
   const filingAlerts = alertsData?.filing_alerts || [];
+  const newCount = [...marketAlerts, ...filingAlerts].filter((a) => isNewAlert(a.alert_ids, newAlertIds)).length;
 
   return (
     <div className="space-y-4 pb-6">
+      {/* Browser notifications (opt-in) and read state */}
+      <div className="space-y-1">
+        <div className="flex items-center justify-between gap-2">
+          <button
+            type="button"
+            role="switch"
+            aria-checked={notifyOn}
+            onClick={toggleNotifications}
+            disabled={!notifySupported}
+            className={`inline-flex min-h-[44px] items-center gap-1.5 rounded-lg border px-2.5 text-xs font-semibold transition disabled:opacity-50 ${
+              notifyOn
+                ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
+                : "border-zinc-800 bg-zinc-900/90 text-zinc-300 hover:text-white"
+            }`}
+          >
+            {notifyOn ? <BellRing className="w-3.5 h-3.5" /> : <BellOff className="w-3.5 h-3.5" />}
+            {notifyOn ? "Browser Notifications On" : "Enable Browser Notifications"}
+          </button>
+          <button
+            type="button"
+            onClick={onMarkAllRead}
+            disabled={newCount === 0}
+            className="inline-flex min-h-[44px] items-center gap-1 rounded-lg border border-zinc-800 bg-zinc-900/90 px-2.5 text-xs font-semibold text-zinc-300 hover:text-white transition disabled:opacity-40"
+          >
+            <CheckCheck className="w-3.5 h-3.5" />
+            Mark all read{newCount > 0 ? ` (${newCount})` : ""}
+          </button>
+        </div>
+        {notifyNote && <p className="text-[11px] text-amber-400/90">{notifyNote}</p>}
+      </div>
       {/* Filing alert window (price/volume alerts always use the latest EOD session) */}
       <div className="flex items-center justify-between gap-2">
         <span className="text-[11px] font-medium text-zinc-400">Filing alert window</span>
@@ -255,8 +365,11 @@ export function AlertsTab({
               return (
                 <div
                   key={item.ticker}
-                  className="rounded-xl border border-amber-500/25 bg-zinc-900/80 p-3 flex items-center justify-between gap-3"
+                  className={`relative rounded-xl border bg-zinc-900/80 p-3 flex items-center justify-between gap-3 ${
+                    isNewAlert(item.alert_ids, newAlertIds) ? "border-rose-500/60" : "border-amber-500/25"
+                  }`}
                 >
+                  {isNewAlert(item.alert_ids, newAlertIds) && <NewPill />}
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
                       <button
@@ -330,11 +443,10 @@ export function AlertsTab({
           </div>
         ) : (
           filingAlerts.map((f) => (
-            <FilingCard
-              key={f.filing_id}
-              filing={f}
-              onSelectTicker={onOpenPull}
-            />
+            <div key={f.filing_id} className="relative">
+              {isNewAlert(f.alert_ids, newAlertIds) && <NewPill />}
+              <FilingCard filing={f} onSelectTicker={onOpenPull} />
+            </div>
           ))
         )}
       </div>

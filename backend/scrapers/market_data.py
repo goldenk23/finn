@@ -1,16 +1,29 @@
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from pathlib import Path
 import yfinance as yf
 from backend.db import get_conn, get_alert_rules, normalize_ticker, DB_PATH
 
+# Fixed offset, not zoneinfo: India has no DST, and zoneinfo on Windows needs the tzdata package.
+IST = timezone(timedelta(hours=5, minutes=30))
+NSE_CLOSE_IST = time(15, 30)
+
+
+def is_completed_session(bar_date: date, now: datetime | None = None) -> bool:
+    """A daily bar is final once its IST date is past, or it is today and the 15:30 IST close has passed."""
+    now_ist = (now or datetime.now(timezone.utc)).astimezone(IST)
+    return bar_date < now_ist.date() or (bar_date == now_ist.date() and now_ist.time() > NSE_CLOSE_IST)
+
 
 def fetch_eod_metrics(
-    tickers: list[str], db_path: Path = DB_PATH, save_to_db: bool = True
+    tickers: list[str], db_path: Path = DB_PATH, save_to_db: bool = True, now: datetime | None = None
 ) -> list[dict[str, Any]]:
     """
     Fetch end-of-day price, 1-day % change, volume, and 20-day average volume
     for a list of NSE tickers (automatically appends .NS if missing).
     Also flags unusual price/volume alerts based on alert_rules in SQLite.
+    Only completed sessions count: during market hours yfinance includes today's unfinished bar
+    (partial volume), which is dropped so alerts and stored rows use the last closed session.
     """
     rules = get_alert_rules(db_path)
     price_thresh = float(rules.get("price_move_pct", 3.0))
@@ -26,6 +39,8 @@ def fetch_eod_metrics(
                 h = yf.Ticker(sym).history(period="1mo", interval="1d", auto_adjust=True)
                 if not h.empty:
                     h = h.dropna(subset=["Close"])
+                if not h.empty and not is_completed_session(h.index[-1].date(), now):
+                    h = h.iloc[:-1]
                 if not h.empty and len(h) >= 2:
                     hist = h
                     break
