@@ -47,6 +47,12 @@ SEED_PORTFOLIO = [
 ]
 
 
+# Key/value app state, e.g. Push refresh bookkeeping (last_refreshed_at, last_refresh_error)
+_APP_META_DDL = (
+    "CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT DEFAULT (datetime('now')))"
+)
+
+
 def get_conn(db_path: Path = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=30.0)
     conn.row_factory = sqlite3.Row
@@ -130,6 +136,7 @@ def init_db(db_path: Path = DB_PATH) -> None:
             );
             """
         )
+        conn.execute(_APP_META_DDL)
         _migrate_renamed_tickers(conn)
         # Seed only a brand-new DB, so stocks the user deleted stay deleted across restarts.
         if conn.execute("SELECT COUNT(*) FROM portfolio").fetchone()[0] == 0:
@@ -165,6 +172,22 @@ def get_portfolio(db_path: Path = DB_PATH) -> list[dict[str, Any]]:
     with get_conn(db_path) as conn:
         rows = conn.execute("SELECT * FROM portfolio ORDER BY ticker").fetchall()
         return [dict(r) for r in rows]
+
+
+def get_meta(db_path: Path = DB_PATH) -> dict[str, str]:
+    with get_conn(db_path) as conn:
+        conn.execute(_APP_META_DDL)  # also on read: a DB copied from before app_meta existed must not crash the digest
+        return {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM app_meta")}
+
+
+def set_meta(values: dict[str, str], db_path: Path = DB_PATH) -> None:
+    with get_conn(db_path) as conn:
+        conn.execute(_APP_META_DDL)
+        conn.executemany(
+            "INSERT INTO app_meta (key, value, updated_at) VALUES (?, ?, datetime('now'))"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            list(values.items()),
+        )
 
 
 def get_alert_rules(db_path: Path = DB_PATH) -> dict[str, Any]:

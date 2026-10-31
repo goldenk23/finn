@@ -1031,6 +1031,160 @@ def test_dedup_picks_informative_primary_card() -> None:
     assert press["also_filed_as"][0]["filing_id"] == "outcome"
 
 
+def test_window_anchor_uses_last_refresh() -> None:
+    import inspect
+    from backend import push_engine
+    from backend.db import set_meta
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        db = Path(tmp) / "anchor.db"
+        init_db(db)
+        conn = sqlite3.connect(db)
+        ins = "INSERT INTO announcements (filing_id, ticker, title, published_at, category, materiality, summary) VALUES (?, 'TRENT', ?, ?, ?, 1, 's')"
+        conn.executemany(ins, [("new", "Financial results Q4", "2024-05-10 10:00:00", "results"),
+                               ("old", "Acquisition of a stake", "2024-05-01 10:00:00", "M&A")])
+        conn.commit()
+        conn.close()
+
+        # Never refreshed: the window falls back to the latest filing
+        d = push_engine.get_windowed_digest("24h", db_path=db)
+        assert d["last_refreshed_at"] is None and d["window_anchor_source"] == "latest_filing", d
+        assert d["window_start"] == "2024-05-09T10:00:00+05:30", d["window_start"]
+        assert [x["filing_id"] for x in d["material"]] == ["new"]
+
+        # After a refresh the window is measured from last_refreshed_at, not MAX(published_at)
+        set_meta({"last_refreshed_at": "2024-05-20T09:00:00+05:30"}, db)
+        d = push_engine.get_windowed_digest("24h", db_path=db)
+        assert d["window_anchor_source"] == "last_refresh" and d["window_start"] == "2024-05-19T09:00:00+05:30", d
+        assert d["material"] == [] and d["cutoff_timestamp"] == "2024-05-19 09:00:00"
+        assert len(push_engine.get_windowed_digest("14d", db_path=db)["material"]) == 1  # 05-06 onward: "new" only
+        alerts = push_engine.get_triggered_alerts("3d", db_path=db)
+        assert alerts["window_start"] == "2024-05-17T09:00:00+05:30" and alerts["last_refreshed_at"] == "2024-05-20T09:00:00+05:30"
+        assert len(push_engine.get_triggered_alerts("30d", db_path=db)["filing_alerts"]) == 2
+
+    # The API default matches the UI's 24h
+    assert inspect.signature(main.api_get_digest).parameters["window"].default.default == "24h"
+
+
+def test_failed_refresh_keeps_last_refreshed_at() -> None:
+    from backend import push_engine
+    from backend.db import get_meta, set_meta
+
+    ok = {"status": "ok", "http_code": 200, "message": "3 filings"}
+    blocked = {"status": "blocked", "http_code": 403, "message": "Access denied"}
+    err = {"status": "error", "http_code": None, "message": "ConnectError: boom"}
+    empty = {"status": "empty", "http_code": 200, "message": "0 filings"}
+    scenario: dict = {}
+
+    def fake_fetch(ticker, **kw):
+        kw["source_status"].update(scenario.get(ticker, scenario["*"]))
+        return []
+
+    patches = {"fetch_eod_metrics": lambda *a, **k: [], "fetch_company_filings": fake_fetch}
+    orig = {k: getattr(push_engine, k) for k in patches}
+    try:
+        for k, v in patches.items():
+            setattr(push_engine, k, v)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            db = Path(tmp) / "refresh.db"
+            init_db(db)
+            set_meta({"last_refreshed_at": "2024-05-20T09:00:00+05:30"}, db)
+
+            # Every source failed: last_refreshed_at stays put, the failed attempt is recorded
+            scenario.update({"*": {"NSE": blocked, "BSE": blocked}, "TRENT": {"NSE": err, "BSE": blocked}})
+            out = push_engine.refresh_portfolio_push_data(db_path=db)
+            meta = get_meta(db)
+            assert out["refresh_ok"] is False and meta["last_refreshed_at"] == "2024-05-20T09:00:00+05:30", (out, meta)
+            assert meta["last_refresh_attempt_at"] > "2024-05-20" and "NSE blocked (HTTP 403)" in meta["last_refresh_error"], meta
+            nse = out["source_status"]["NSE"]
+            assert nse["status"] == "blocked" and nse["counts"] == {"blocked": len(SEED_PORTFOLIO) - 1, "error": 1}, nse
+            status = push_engine.get_push_data_status(24, db_path=db)
+            assert status["last_refresh_error"] and status["source_status"]["BSE"]["status"] == "blocked", status
+            assert status["window_start"] == "2024-05-19T09:00:00+05:30"
+
+            # One stock's exchange answered (even with no rows): the refresh counts, the error clears
+            scenario.clear()
+            scenario.update({"*": {"NSE": err, "BSE": blocked}, "TRENT": {"NSE": err, "BSE": empty}})
+            out = push_engine.refresh_portfolio_push_data(db_path=db)
+            meta = get_meta(db)
+            assert out["refresh_ok"] is True and meta["last_refreshed_at"] == meta["last_refresh_attempt_at"] > "2024-05-21", meta
+            assert out["source_status"]["BSE"]["status"] == "empty" and "stocks failed" in out["source_status"]["BSE"]["message"]
+            assert push_engine.get_push_data_status(24, db_path=db)["last_refresh_error"] is None
+
+            scenario.clear()
+            scenario["*"] = {"NSE": ok}
+            out = push_engine.refresh_portfolio_push_data(db_path=db)
+            assert out["source_status"] == {"NSE": {**ok, "message": f"{len(SEED_PORTFOLIO)} stocks checked", "counts": {"ok": len(SEED_PORTFOLIO)}}}, out
+    finally:
+        for k, v in orig.items():
+            setattr(push_engine, k, v)
+
+
+def test_filing_source_status_and_bse_fallback() -> None:
+    import httpx
+    from backend.scrapers import filings
+
+    nse_rows = [{"desc": f"Disclosure {i}", "attchmntFile": f"https://x/{i}.pdf", "an_dt": "10-May-2024 10:00:00",
+                 "sm_name": "Trent Limited"} for i in range(30)]
+    bse_rows = {"Table": [{"NEWSSUB": "Outcome of Board Meeting", "ATTACHMENTNAME": "a.pdf", "NEWS_DT": "2024-05-10T10:00:00",
+                           "SLONGNAME": "Trent Ltd"}]}
+    script: dict = {}
+    calls: list[str] = []
+
+    class FakeClient:
+        def __init__(self, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get(self, url, **kw):
+            calls.append(url)
+            host = "bse_api" if "api.bseindia.com" in url else "nse_api" if "/api/" in url else "warmup"
+            reply = script.get(host, httpx.Response(200, text="<html></html>"))
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+    def run(nse, bse=None, **kw):
+        calls.clear()
+        script.clear()
+        script.update(nse_api=nse, **({"bse_api": bse} if bse is not None else {}))
+        status: dict = {}
+        items = filings.fetch_company_filings("TRENT", bse_code="500251", source_status=status, **{"save_to_db": False, **kw})
+        return items, {k: v["status"] for k, v in status.items()}
+
+    orig = filings.httpx.Client
+    filings.httpx.Client = FakeClient
+    try:
+        # NSE exception -> error, BSE tried as the fallback after a cookie warm-up on www.bseindia.com
+        items, st = run(httpx.ConnectError("boom"), httpx.Response(403, text="Access Denied"))
+        assert items == [] and st == {"NSE": "error", "BSE": "blocked"}, st
+        assert calls.index("https://www.bseindia.com/") < next(i for i, u in enumerate(calls) if "api.bseindia.com" in u), calls
+        items, st = run(httpx.Response(403, text="Access Denied"), httpx.Response(200, json=bse_rows))
+        assert st == {"NSE": "blocked", "BSE": "ok"} and [f["exchange"] for f in items] == ["BSE"], (st, items)
+        items, st = run(httpx.Response(200, json=[]), httpx.Response(200, json={"Table": []}))
+        assert items == [] and st == {"NSE": "empty", "BSE": "empty"}, st
+        _, st = run(httpx.Response(200, text="<html>Access Denied</html>"), httpx.Response(500, text="x"))
+        assert st == {"NSE": "blocked", "BSE": "error"}, st
+
+        # 30 NSE filings in the window: all kept (no 25-row cutoff), BSE not called, Pull-style save still works
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            db = Path(tmp) / "filings.db"
+            init_db(db)
+            items, st = run(httpx.Response(200, json=nse_rows), save_to_db=True, db_path=db)
+            conn = sqlite3.connect(db)
+            saved = conn.execute("SELECT COUNT(*) FROM announcements WHERE ticker = 'TRENT'").fetchone()[0]
+            conn.close()
+        assert st == {"NSE": "ok"} and len(items) == 30 == saved, (st, len(items), saved)
+        assert not any("bseindia" in u for u in calls), calls
+    finally:
+        filings.httpx.Client = orig
+
+
 if __name__ == "__main__":
     tests = [fn for name, fn in sorted(globals().items()) if name.startswith("test_") and callable(fn)]
     for fn in tests:

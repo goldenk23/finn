@@ -10,8 +10,44 @@ import {
   CheckCircle2,
   Layers,
 } from "lucide-react";
-import { DigestResponse, PortfolioItem, TimeWindow } from "@/types/finn";
+import { DigestResponse, PortfolioItem, PushDataStatus, SourceStatus, TimeWindow } from "@/types/finn";
 import { FilingCard } from "@/components/FilingCard";
+
+const STALE_AFTER_MS = 12 * 60 * 60 * 1000;
+
+export function formatIst(iso: string): string {
+  const s = new Date(iso).toLocaleString("en-IN", {
+    timeZone: "Asia/Kolkata",
+    day: "2-digit",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  return `${s} IST`;
+}
+
+/** Freshness + exchange label for the header and Push tab, e.g. "NSE Live • BSE blocked" or "Cached". */
+export function pushDataStatus(d: PushDataStatus | null) {
+  const asOf = d?.last_refreshed_at ?? null;
+  const stale = !asOf || Date.now() - new Date(asOf).getTime() > STALE_AFTER_MS;
+  const attemptFailed = Boolean(d?.last_refresh_error);
+  const src = d?.source_status;
+  const word = (s: SourceStatus) => (s.status === "ok" || s.status === "empty" ? "Live" : s.status);
+  // Never refreshed, last attempt failed, or older than 12h: what's on screen is cached data
+  const live = Boolean(src?.NSE || src?.BSE) && !attemptFailed && !stale;
+  const label = !d
+    ? "Loading"
+    : live
+      ? [src?.NSE && `NSE ${word(src.NSE)}`, src?.BSE && `BSE ${word(src.BSE)}`].filter(Boolean).join(" • ")
+      : "Cached";
+  const detail = src
+    ? Object.entries(src)
+        .map(([name, s]) => `${name}: ${s.status}${s.http_code ? ` (HTTP ${s.http_code})` : ""} — ${s.message}`)
+        .join("\n")
+    : "No refresh recorded yet";
+  return { asOf, stale, attemptFailed, live, label, detail };
+}
 
 interface PushTabProps {
   digest: DigestResponse | null;
@@ -54,6 +90,7 @@ export function PushTab({
   };
   const material = digest?.material || [];
   const routine = digest?.routine || [];
+  const ds = pushDataStatus(digest);
 
   return (
     <div className="space-y-3.5 pb-6">
@@ -93,6 +130,37 @@ export function PushTab({
         >
           {refreshError}
         </p>
+      )}
+
+      {/* Data freshness + real exchange status */}
+      {digest && (
+        <div className="-mt-1.5 space-y-1 px-0.5 text-[11px] font-mono">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+            <span className={ds.stale ? "text-amber-300" : "text-zinc-400"}>
+              {ds.asOf ? `Data as of ${formatIst(ds.asOf)}` : "Never refreshed"}
+              {ds.asOf && ds.stale ? " • over 12h old" : ""}
+            </span>
+            <span
+              title={ds.detail}
+              className={`rounded px-1.5 py-0.5 ${
+                ds.live ? "bg-emerald-500/10 text-emerald-300" : "bg-zinc-800/80 text-zinc-400"
+              }`}
+            >
+              {ds.label}
+            </span>
+          </div>
+          {digest.last_refresh_error && digest.last_refresh_attempt_at && (
+            <p className="text-amber-300/90 break-words">
+              Last refresh {formatIst(digest.last_refresh_attempt_at)} failed, showing cached data:{" "}
+              {digest.last_refresh_error}
+            </p>
+          )}
+          {digest.window_anchor_source === "latest_filing" && (
+            <p className="text-zinc-500">
+              Windows count back from the latest filing ({formatIst(digest.window_anchor)}).
+            </p>
+          )}
+        </div>
       )}
 
       {/* Horizontal Portfolio Ticker Filter Chips */}

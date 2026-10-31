@@ -7,6 +7,7 @@ import {
   DigestResponse,
   PortfolioItem,
   PullResponse,
+  PushDataStatus,
   TimeWindow,
 } from "@/types/finn";
 
@@ -107,16 +108,19 @@ export const finnApi = {
     return request<DigestResponse>(`/api/push/digest?${params.toString()}`);
   },
 
-  refreshPush: (tickers?: string[], days = 14, max_enrich = 4) =>
-    request<{
-      stocks_refreshed: number;
-      eod_updated: number;
-      filings_checked: number;
-      filings_triaged_by_llm: number;
-      filings_deep_enriched: number;
-    }>("/api/push/refresh", {
+  refreshPush: (tickers?: string[], days = 14, max_enrich = 4, window: TimeWindow = "24h") =>
+    request<
+      PushDataStatus & {
+        stocks_refreshed: number;
+        eod_updated: number;
+        filings_checked: number;
+        filings_triaged_by_llm: number;
+        filings_deep_enriched: number;
+        refresh_ok: boolean;
+      }
+    >("/api/push/refresh", {
       method: "POST",
-      body: JSON.stringify({ tickers: tickers || null, days, max_enrich }),
+      body: JSON.stringify({ tickers: tickers || null, days, max_enrich, window }),
     }),
 
   enrichFiling: (filingId: string) =>

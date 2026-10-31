@@ -1,10 +1,10 @@
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
 from typing import Any
 
-from backend.db import get_conn, get_portfolio, get_alert_rules, DB_PATH
+from backend.db import get_conn, get_portfolio, get_alert_rules, get_meta, set_meta, DB_PATH
 from backend.scrapers.market_data import fetch_eod_metrics
 from backend.scrapers.filings import (
     PERSON_HONORIFIC,
@@ -20,9 +20,13 @@ from backend.llm_router import (
     enrich_management_change,
 )
 
+# Exchange timestamps (announcements.published_at) are naive IST, so window maths runs in IST
+IST = timezone(timedelta(hours=5, minutes=30))
+
 WINDOW_HOURS = {
     "24h": 24,
     "48h": 48,
+    "3d": 24 * 3,
     "7d": 24 * 7,
     "14d": 24 * 14,
     "30d": 24 * 30,
@@ -151,10 +155,18 @@ def refresh_portfolio_push_data(
     ticker_list = [p["ticker"] for p in portfolio]
     eod_metrics = fetch_eod_metrics(ticker_list, db_path=db_path, save_to_db=True)
 
+    attempt_at = datetime.now(IST).isoformat(timespec="seconds")
     scraped_count = 0
+    per_ticker_status: list[dict[str, dict[str, Any]]] = []
     for p in portfolio:
-        items = fetch_company_filings(p["ticker"], bse_code=p["bse_code"], days=days, db_path=db_path, save_to_db=True)
+        status: dict[str, dict[str, Any]] = {}
+        items = fetch_company_filings(
+            p["ticker"], bse_code=p["bse_code"], days=days, db_path=db_path, save_to_db=True, source_status=status
+        )
         scraped_count += len(items)
+        per_ticker_status.append(status)
+    source_status = _summarize_source_status(per_ticker_status)
+    refresh_ok = _record_refresh(attempt_at, source_status, db_path)
 
     # A refresh scoped to `tickers` triages only those stocks; otherwise every blank row, Pull-saved ones included.
     triage = triage_untriaged_filings(tickers=ticker_list if tickers else None, db_path=db_path)
@@ -191,7 +203,57 @@ def refresh_portfolio_push_data(
         "filings_triaged_by_llm": triage["triaged"],
         "filings_left_untriaged": triage["left"],
         "filings_deep_enriched": enriched_count,
+        "refresh_ok": refresh_ok,
+        "source_status": source_status,
     }
+
+
+_STATUS_RANK = {"ok": 0, "empty": 1, "blocked": 2, "error": 3}
+
+
+def _summarize_source_status(per_ticker: list[dict[str, dict[str, Any]]]) -> dict[str, dict[str, Any]]:
+    """
+    One status per exchange across all stocks: the best one any stock got (ok > empty > blocked > error),
+    with per-status counts. http_code/message come from the first failure, so a partial outage stays visible.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for src in ("NSE", "BSE"):
+        rows = [s[src] for s in per_ticker if src in s]
+        if not rows:
+            continue
+        counts: dict[str, int] = {}
+        for r in rows:
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
+        best = min(rows, key=lambda r: _STATUS_RANK.get(r["status"], 9))
+        fails = [r for r in rows if r["status"] in ("blocked", "error")]
+        rep = fails[0] if fails else best
+        out[src] = {
+            "status": best["status"],
+            "http_code": rep["http_code"],
+            "message": f"{len(fails)}/{len(rows)} stocks failed: {rep['message']}" if fails else f"{len(rows)} stocks checked",
+            "counts": counts,
+        }
+    return out
+
+
+def _record_refresh(attempt_at: str, source_status: dict[str, dict[str, Any]], db_path: Path = DB_PATH) -> bool:
+    """
+    Advance last_refreshed_at only if some exchange answered (ok or empty). When every source failed, keep the old
+    last_refreshed_at so the UI shows the data as cached, and record the failed attempt and why.
+    ponytail: one global timestamp, so a refresh scoped to one ticker also moves the anchor for the whole portfolio.
+    Upgrade path: a per-ticker last_refreshed_at column on portfolio.
+    """
+    ok = any(s["status"] in ("ok", "empty") for s in source_status.values())
+    meta = {"last_refresh_attempt_at": attempt_at, "last_source_status": json.dumps(source_status)}
+    if ok:
+        meta.update(last_refreshed_at=attempt_at, last_refresh_error="")
+    else:
+        meta["last_refresh_error"] = "; ".join(
+            f"{src} {s['status']}" + (f" (HTTP {s['http_code']})" if s.get("http_code") else "") + f": {s['message']}"
+            for src, s in source_status.items()
+        ) or "No filing source was queried"
+    set_meta(meta, db_path)
+    return ok
 
 
 def _format_announcement_row(row: Any) -> dict[str, Any]:
@@ -299,12 +361,17 @@ def _deduplicate_material_filings(
     return deduped, duplicates
 
 
-def _get_reference_now(conn: Any) -> datetime:
+def _get_reference_now(conn: Any, last_refreshed_at: str | None) -> tuple[datetime, str]:
     """
-    Anchors digest/alert windows to the latest portfolio filing timestamp if the DB
-    has not been refreshed in the current session, ensuring offline demo evaluation
-    never renders an empty 24h window.
+    (anchor, source) that digest/alert windows are measured back from, as an IST-aware datetime:
+    the last successful refresh; only if the app has never refreshed, the latest portfolio filing; else now.
     """
+    if last_refreshed_at:
+        try:
+            return datetime.fromisoformat(last_refreshed_at).astimezone(IST), "last_refresh"
+        except ValueError:
+            pass
+    now = datetime.now(IST)
     row = conn.execute(
         """
         SELECT MAX(published_at) as max_pub
@@ -312,15 +379,34 @@ def _get_reference_now(conn: Any) -> datetime:
         WHERE ticker IN (SELECT ticker FROM portfolio)
         """
     ).fetchone()
-    now = datetime.now()
     if row and row["max_pub"]:
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
             try:
-                max_dt = datetime.strptime(str(row["max_pub"])[:19], fmt)
-                return min(now, max_dt)
+                max_dt = datetime.strptime(str(row["max_pub"])[:19], fmt).replace(tzinfo=IST)
+                return min(now, max_dt), "latest_filing"
             except ValueError:
                 continue
-    return now
+    return now, "now"
+
+
+def get_push_data_status(hours: int = 24, db_path: Path = DB_PATH) -> dict[str, Any]:
+    """Freshness and exchange status shared by the digest, alerts and refresh responses. Timestamps are ISO, IST."""
+    meta = get_meta(db_path)
+    with get_conn(db_path) as conn:
+        anchor, anchor_source = _get_reference_now(conn, meta.get("last_refreshed_at"))
+    start = anchor - timedelta(hours=hours)
+    return {
+        "last_refreshed_at": meta.get("last_refreshed_at") or None,
+        "last_refresh_attempt_at": meta.get("last_refresh_attempt_at") or None,
+        # Non-empty only when the latest attempt failed for every source (cleared by the next good refresh)
+        "last_refresh_error": meta.get("last_refresh_error") or None,
+        "source_status": json.loads(meta.get("last_source_status") or "null"),
+        "window_anchor": anchor.isoformat(timespec="seconds"),
+        "window_anchor_source": anchor_source,
+        "window_start": start.isoformat(timespec="seconds"),
+        # Same instant as window_start, in the naive IST format published_at is stored in
+        "cutoff_timestamp": start.strftime("%Y-%m-%d %H:%M:%S"),
+    }
 
 
 def get_windowed_digest(
@@ -332,11 +418,10 @@ def get_windowed_digest(
     Returns corporate announcements within the chosen time window (24h, 7d, 30d),
     split into prioritized Material items and collapsed Routine items.
     """
-    hours = WINDOW_HOURS.get(window, 24)
+    data_status = get_push_data_status(WINDOW_HOURS.get(window, 24), db_path=db_path)
+    cutoff_str = data_status["cutoff_timestamp"]
 
     with get_conn(db_path) as conn:
-        ref_now = _get_reference_now(conn)
-        cutoff_str = (ref_now - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
         if tickers:
             clean = [t.upper().strip() for t in tickers]
             placeholders = ",".join("?" for _ in clean)
@@ -372,7 +457,7 @@ def get_windowed_digest(
 
     return {
         "window": window,
-        "cutoff_timestamp": cutoff_str,
+        **data_status,
         "stats": {
             "total_filings": total,
             "material_count": len(material),
@@ -410,12 +495,10 @@ def get_triggered_alerts(
     vol_thresh = float(rules.get("volume_multiplier", 2.0))
     watched_cats = set(rules.get("watched_categories", []))
 
-    hours = WINDOW_HOURS.get(window, 24 * 7)
+    data_status = get_push_data_status(WINDOW_HOURS.get(window, 24 * 7), db_path=db_path)
+    cutoff_str = data_status["cutoff_timestamp"]
 
     with get_conn(db_path) as conn:
-        ref_now = _get_reference_now(conn)
-        cutoff_str = (ref_now - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
-
         # Latest EOD price row per portfolio ticker
         eod_rows = conn.execute(
             """
@@ -474,6 +557,7 @@ def get_triggered_alerts(
     return {
         "rules": rules,
         "window": window,
+        **data_status,
         "total_alerts": len(market_alerts) + len(filing_alerts),
         "market_alerts": market_alerts,
         "filing_alerts": filing_alerts,

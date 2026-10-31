@@ -77,7 +77,9 @@ from backend.scrapers.market_data import fetch_eod_metrics
 from backend.scrapers.filings import fetch_company_filings
 from backend.scrapers.screener import fetch_screener_fundamentals
 from backend.push_engine import (
+    WINDOW_HOURS,
     refresh_portfolio_push_data,
+    get_push_data_status,
     get_windowed_digest,
     get_triggered_alerts,
     enrich_single_filing,
@@ -218,6 +220,8 @@ class RefreshRequest(BaseModel):
     tickers: list[str] | None = Field(None, max_length=30)
     days: int = Field(14, ge=1, le=30)
     max_enrich: int = Field(5, ge=0, le=6)
+    # Digest window the client is showing, so the response's window_start matches it
+    window: str = Field("24h", max_length=8)
 
 
 class AddPortfolioTickerRequest(BaseModel):
@@ -332,7 +336,7 @@ def api_remove_portfolio_stock(ticker: str) -> dict[str, Any]:
 
 @app.get("/api/push/digest")
 def api_get_digest(
-    window: str = Query("7d", description="Time window: 24h, 48h, 7d, 14d, 30d"),
+    window: str = Query("24h", description="Time window: 24h, 48h, 3d, 7d, 14d, 30d"),
     ticker: str | None = Query(None, description="Optional single ticker filter"),
 ) -> dict[str, Any]:
     tickers = [_ticker_or_400(ticker)] if ticker else None
@@ -348,7 +352,7 @@ def api_refresh_push(req: RefreshRequest, request: Request) -> dict[str, Any]:
         days=req.days,
         max_enrich=req.max_enrich,
     )
-    return stats
+    return {**stats, **get_push_data_status(WINDOW_HOURS.get(req.window, 24))}
 
 
 @app.post("/api/push/enrich/{filing_id}")

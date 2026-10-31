@@ -193,10 +193,30 @@ def _make_filing_id(ticker: str, title: str, pub_dt: str, pdf_url: str) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def fetch_nse_announcements(ticker: str, days: int = 10) -> list[dict[str, Any]]:
+def _source_status(status: str, http_code: int | None = None, message: str = "") -> dict[str, Any]:
+    """status: ok (rows returned), empty (answered with no rows), blocked (401/403/429 or an Access Denied page), error."""
+    return {"status": status, "http_code": http_code, "message": message[:200]}
+
+
+def _read_json(resp: httpx.Response) -> tuple[Any, dict[str, Any] | None]:
+    """(payload, None) on a usable 200 JSON reply, else (None, failure status)."""
+    if resp.status_code in (401, 403, 429):
+        return None, _source_status("blocked", resp.status_code, "Rate limited" if resp.status_code == 429 else "Access denied")
+    if resp.status_code != 200:
+        return None, _source_status("error", resp.status_code, f"HTTP {resp.status_code}")
+    try:
+        return resp.json(), None
+    except ValueError:
+        # Akamai can answer 200 with an HTML "Access Denied" page instead of JSON
+        if "access denied" in resp.text[:2000].lower():
+            return None, _source_status("blocked", resp.status_code, "Access denied page instead of JSON")
+        return None, _source_status("error", resp.status_code, "Response was not JSON")
+
+
+def fetch_nse_announcements(ticker: str, days: int = 10) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """
     Fetch corporate announcements for an NSE ticker using NSE's official JSON API
-    with session cookie warm-up.
+    with session cookie warm-up. Returns (items, source status).
     """
     clean_ticker = normalize_ticker(ticker)
     symbol_q = quote(clean_ticker, safe="")  # "M&M" -> "M%26M" so '&' can't split the query string
@@ -219,13 +239,15 @@ def fetch_nse_announcements(ticker: str, days: int = 10) -> list[dict[str, Any]]
             # Warm up NSE cookies
             client.get("https://www.nseindia.com")
             resp = client.get(url)
-            if resp.status_code != 200:
-                return []
-            data = resp.json()
+            data, failed = _read_json(resp)
+            if failed:
+                print(f"[filings:NSE] {clean_ticker} {failed['status']}: {failed['message']}")
+                return [], failed
             if not isinstance(data, list):
-                return []
+                return [], _source_status("error", resp.status_code, "Unexpected JSON shape")
 
-            for row in data[:25]:
+            # No row cap: the API is already bounded by from_date, and a cap drops older filings in the window
+            for row in data:
                 subject = (row.get("desc") or "").strip()
                 att_text = (row.get("attchmntText") or "").strip()
                 title = f"{subject}: {att_text}" if att_text and att_text != subject else subject
@@ -259,15 +281,16 @@ def fetch_nse_announcements(ticker: str, days: int = 10) -> list[dict[str, Any]]
                 )
     except Exception as exc:
         print(f"[filings:NSE] {clean_ticker} failed: {exc}")
-    return items
+        return [], _source_status("error", None, f"{type(exc).__name__}: {exc}")
+    return items, _source_status("ok" if items else "empty", 200, f"{len(items)} filings")
 
 
-def fetch_bse_announcements(ticker: str, bse_code: str, days: int = 10) -> list[dict[str, Any]]:
+def fetch_bse_announcements(ticker: str, bse_code: str, days: int = 10) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """
-    Fallback/supplemental fetcher using BSE India's public corporate announcements API.
+    Fallback/supplemental fetcher using BSE India's public corporate announcements API. Returns (items, source status).
     """
     if not bse_code:
-        return []
+        return [], _source_status("error", None, "No BSE code")
     clean_ticker = normalize_ticker(ticker)
     to_dt = datetime.now().strftime("%Y%m%d")
     from_dt = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
@@ -285,12 +308,18 @@ def fetch_bse_announcements(ticker: str, bse_code: str, days: int = 10) -> list[
     items: list[dict[str, Any]] = []
     try:
         with httpx.Client(headers=headers, follow_redirects=True, timeout=15.0) as client:
+            # Warm up BSE cookies the way a browser would. No proxies or UA rotation: if BSE still says 403,
+            # the status reports it as blocked.
+            client.get("https://www.bseindia.com/", headers={"Accept": "text/html,application/xhtml+xml,*/*;q=0.8"})
             resp = client.get(url)
-            if resp.status_code != 200:
-                return []
-            payload = resp.json()
+            payload, failed = _read_json(resp)
+            if failed:
+                print(f"[filings:BSE] {clean_ticker} ({bse_code}) {failed['status']}: {failed['message']}")
+                return [], failed
+            if not isinstance(payload, dict):
+                return [], _source_status("error", resp.status_code, "Unexpected JSON shape")
             rows = payload.get("Table") or []
-            for row in rows[:25]:
+            for row in rows:
                 headline = (row.get("NEWSSUB") or row.get("HEADLINE") or "").strip()
                 more = (row.get("MORE") or "").strip()
                 title = f"{headline} — {more}" if more and more not in headline else headline
@@ -316,19 +345,29 @@ def fetch_bse_announcements(ticker: str, bse_code: str, days: int = 10) -> list[
                 )
     except Exception as exc:
         print(f"[filings:BSE] {clean_ticker} ({bse_code}) failed: {exc}")
-    return items
+        return [], _source_status("error", None, f"{type(exc).__name__}: {exc}")
+    return items, _source_status("ok" if items else "empty", 200, f"{len(items)} filings")
 
 
 def fetch_company_filings(
-    ticker: str, bse_code: str = "", days: int = 10, db_path: Path = DB_PATH, save_to_db: bool = True
+    ticker: str,
+    bse_code: str = "",
+    days: int = 10,
+    db_path: Path = DB_PATH,
+    save_to_db: bool = True,
+    source_status: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Fetch recent filings for a stock (NSE primary, BSE fallback), classify them,
-    and persist to SQLite.
+    Fetch recent filings for a stock (NSE primary, BSE fallback when NSE is empty, blocked or errors),
+    classify them, and persist to SQLite. If `source_status` is given, it is filled with
+    {"NSE": status, "BSE": status} (BSE only when it was tried); see _source_status.
     """
-    filings = fetch_nse_announcements(ticker, days=days)
-    if not filings and bse_code:
-        filings = fetch_bse_announcements(ticker, bse_code=bse_code, days=days)
+    filings, nse = fetch_nse_announcements(ticker, days=days)
+    statuses = {"NSE": nse}
+    if nse["status"] != "ok" and bse_code:
+        filings, statuses["BSE"] = fetch_bse_announcements(ticker, bse_code=bse_code, days=days)
+    if source_status is not None:
+        source_status.update(statuses)
 
     if save_to_db and filings:
         with get_conn(db_path) as conn:

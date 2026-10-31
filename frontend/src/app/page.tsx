@@ -19,7 +19,7 @@ import {
   TimeWindow,
 } from "@/types/finn";
 import { finnApi } from "@/lib/api";
-import { PushTab } from "@/components/PushTab";
+import { PushTab, formatIst, pushDataStatus } from "@/components/PushTab";
 import { AlertsTab } from "@/components/AlertsTab";
 import { PullTab } from "@/components/PullTab";
 import { PortfolioTab } from "@/components/PortfolioTab";
@@ -43,7 +43,8 @@ export default function FinnAppPage() {
   const [refreshingPush, setRefreshingPush] = useState<boolean>(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
 
-  // Alerts state
+  // Alerts state: its own window (default 14d), so rule saves and refreshes never reload Alerts with the digest window
+  const [alertsWindow, setAlertsWindow] = useState<TimeWindow>("14d");
   const [alertsData, setAlertsData] = useState<AlertsResponse | null>(null);
   const [alertsLoading, setAlertsLoading] = useState<boolean>(true);
   const [savingRules, setSavingRules] = useState<boolean>(false);
@@ -161,9 +162,12 @@ export default function FinnAppPage() {
   useEffect(() => {
     loadPortfolio();
     loadTelemetryAndCache();
-    loadAlerts("14d");
     loadPullReport("TRENT", false);
-  }, [loadPortfolio, loadTelemetryAndCache, loadAlerts, loadPullReport]);
+  }, [loadPortfolio, loadTelemetryAndCache, loadPullReport]);
+
+  useEffect(() => {
+    loadAlerts(alertsWindow);
+  }, [alertsWindow, loadAlerts]);
 
   useEffect(() => {
     loadDigest(digestWindow, digestTicker);
@@ -176,11 +180,12 @@ export default function FinnAppPage() {
       await finnApi.refreshPush(
         digestTicker ? [digestTicker] : undefined,
         14,
-        3
+        3,
+        digestWindow
       );
       await Promise.all([
         loadDigest(digestWindow, digestTicker),
-        loadAlerts(digestWindow),
+        loadAlerts(alertsWindow),
         loadPortfolio(),
         loadTelemetryAndCache(),
       ]);
@@ -199,7 +204,7 @@ export default function FinnAppPage() {
     try {
       setSavingRules(true);
       await finnApi.updateAlertRules(rules);
-      await Promise.all([loadAlerts(digestWindow), loadPortfolio()]);
+      await Promise.all([loadAlerts(alertsWindow), loadPortfolio()]);
     } finally {
       setSavingRules(false);
     }
@@ -228,7 +233,7 @@ export default function FinnAppPage() {
     await Promise.all([
       loadPortfolio(),
       loadDigest(digestWindow, digestTicker),
-      loadAlerts(digestWindow),
+      loadAlerts(alertsWindow),
     ]);
   }
 
@@ -237,7 +242,7 @@ export default function FinnAppPage() {
     await Promise.all([
       loadPortfolio(),
       loadDigest(digestWindow, digestTicker),
-      loadAlerts(digestWindow),
+      loadAlerts(alertsWindow),
     ]);
   }
 
@@ -249,35 +254,49 @@ export default function FinnAppPage() {
   const totalCostUsd = costData?.totals?.cost_usd || 0;
   const materialCount = digest?.stats?.material_count || 0;
   const totalAlerts = alertsData?.total_alerts || 0;
+  const dataStatus = pushDataStatus(digest);
 
   return (
     <div className="min-h-screen w-full bg-[#050507] flex justify-center">
       {/* Mobile-First Institutional Shell (430px max width on desktop, 100% on phone) */}
       <div className="w-full max-w-[430px] min-h-screen flex flex-col border-x border-zinc-800/80 bg-zinc-950 shadow-2xl relative">
         {/* Sticky Top Header */}
-        <header className="sticky top-0 z-30 border-b border-zinc-800/90 bg-zinc-950/90 backdrop-blur-md px-3.5 py-2.5 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <div className="h-7 w-7 rounded-lg bg-emerald-500 flex items-center justify-center text-zinc-950 font-mono font-black text-sm shadow-sm">
+        <header className="sticky top-0 z-30 border-b border-zinc-800/90 bg-zinc-950/90 backdrop-blur-md px-3.5 py-2.5 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <div className="h-7 w-7 shrink-0 rounded-lg bg-emerald-500 flex items-center justify-center text-zinc-950 font-mono font-black text-sm shadow-sm">
               <Terminal className="w-4 h-4 stroke-[2.5]" />
             </div>
-            <div>
-              <div className="flex items-center gap-1.5">
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 min-w-0">
                 <span className="text-sm font-black tracking-tight text-white">
                   FINN
                 </span>
-                <span className="inline-flex items-center gap-1 rounded-full bg-zinc-900 border border-zinc-800 px-1.5 py-0.5 text-[9px] font-mono text-zinc-300">
+                <span
+                  title={dataStatus.detail}
+                  className="inline-flex min-w-0 items-center gap-1 rounded-full bg-zinc-900 border border-zinc-800 px-1.5 py-0.5 text-[9px] font-mono text-zinc-300"
+                >
                   <span
-                    className={`h-1.5 w-1.5 rounded-full ${
-                      backendOnline
-                        ? "bg-emerald-400 animate-pulse"
-                        : "bg-rose-500"
+                    className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                      !backendOnline
+                        ? "bg-rose-500"
+                        : dataStatus.live
+                          ? "bg-emerald-400 animate-pulse"
+                          : "bg-amber-400"
                     }`}
                   />
-                  {backendOnline ? "NSE/BSE LIVE" : "OFFLINE"}
+                  <span className="truncate">{backendOnline ? dataStatus.label : "OFFLINE"}</span>
                 </span>
               </div>
-              <p className="text-[10px] font-mono text-zinc-500">
-                Primary-Source Equity Intelligence
+              <p
+                className={`truncate text-[10px] font-mono ${
+                  dataStatus.asOf && dataStatus.stale ? "text-amber-400/90" : "text-zinc-500"
+                }`}
+              >
+                {dataStatus.asOf
+                  ? `Data as of ${formatIst(dataStatus.asOf)}${dataStatus.stale ? " • stale" : ""}`
+                  : digest
+                    ? "Never refreshed • cached data"
+                    : "Primary-Source Equity Intelligence"}
               </p>
             </div>
           </div>
@@ -289,7 +308,7 @@ export default function FinnAppPage() {
               loadTelemetryAndCache();
               setCostDrawerOpen(true);
             }}
-            className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/35 bg-emerald-500/10 hover:bg-emerald-500/20 px-2.5 py-1 text-[11px] font-mono text-emerald-300 transition"
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-emerald-500/35 bg-emerald-500/10 hover:bg-emerald-500/20 px-2.5 py-1 text-[11px] font-mono text-emerald-300 transition"
             title="View Vertex AI 3-Tier Model Routing & Token Spend"
           >
             <Cpu className="w-3 h-3 text-emerald-400" />
@@ -326,8 +345,8 @@ export default function FinnAppPage() {
               savingRules={savingRules}
               onUpdateRules={handleUpdateAlertRules}
               onOpenPull={handleOpenPullFromAnywhere}
-              window={digestWindow}
-              onChangeWindow={setDigestWindow}
+              window={alertsWindow}
+              onChangeWindow={setAlertsWindow}
             />
           )}
 

@@ -1,4 +1,26 @@
-export type TimeWindow = "24h" | "48h" | "7d" | "14d" | "30d";
+export type TimeWindow = "24h" | "48h" | "3d" | "7d" | "14d" | "30d";
+
+export interface SourceStatus {
+  status: "ok" | "empty" | "blocked" | "error";
+  http_code: number | null;
+  message: string;
+  /** Stocks per status in the last refresh, e.g. { ok: 15, error: 1 } */
+  counts?: Record<string, number>;
+}
+
+/** Push data freshness, returned by /api/push/digest, /api/push/alerts and /api/push/refresh. ISO timestamps in IST. */
+export interface PushDataStatus {
+  last_refreshed_at: string | null;
+  last_refresh_attempt_at: string | null;
+  /** Set only when the latest refresh failed for every source; the data shown is cached. */
+  last_refresh_error: string | null;
+  /** Exchange status from the latest refresh attempt; BSE is present only if it was tried. */
+  source_status: { NSE?: SourceStatus; BSE?: SourceStatus } | null;
+  window_anchor: string;
+  window_anchor_source: "last_refresh" | "latest_filing" | "now";
+  window_start: string;
+  cutoff_timestamp: string;
+}
 
 export interface MetricDelta {
   value: string;
@@ -53,9 +75,8 @@ export interface FilingItem {
   also_filed_as?: { filing_id: string; title: string; pdf_url?: string; published_at: string }[];
 }
 
-export interface DigestResponse {
+export interface DigestResponse extends PushDataStatus {
   window: TimeWindow;
-  cutoff_timestamp: string;
   stats: {
     total_filings: number;
     material_count: number;
@@ -98,7 +119,7 @@ export interface PortfolioItem {
   trigger_reasons?: string[];
 }
 
-export interface AlertsResponse {
+export interface AlertsResponse extends PushDataStatus {
   rules: AlertRules;
   window: string;
   total_alerts: number;

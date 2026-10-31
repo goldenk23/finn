@@ -28,6 +28,8 @@ interface AlertsTabProps {
   onChangeWindow: (w: TimeWindow) => void;
 }
 
+const ALERT_WINDOWS: TimeWindow[] = ["24h", "3d", "7d", "14d", "30d"];
+
 const WATCHABLE_CATEGORIES = [
   { id: "results", label: "Results" },
   { id: "M&A", label: "M&A" },
@@ -47,6 +49,8 @@ export function AlertsTab({
   savingRules,
   onUpdateRules,
   onOpenPull,
+  window,
+  onChangeWindow,
 }: AlertsTabProps) {
   const [pricePct, setPricePct] = useState<number>(3.0);
   const [volMult, setVolMult] = useState<number>(2.0);
@@ -94,6 +98,32 @@ export function AlertsTab({
 
   return (
     <div className="space-y-4 pb-6">
+      {/* Filing alert window (price/volume alerts always use the latest EOD session) */}
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[11px] font-medium text-zinc-400">Filing alert window</span>
+        <div
+          role="group"
+          aria-label="Filing alert window"
+          className="inline-flex items-center rounded-lg border border-zinc-800 bg-zinc-900/90 p-0.5"
+        >
+          {ALERT_WINDOWS.map((w) => (
+            <button
+              key={w}
+              type="button"
+              aria-pressed={window === w}
+              onClick={() => onChangeWindow(w)}
+              className={`px-2.5 py-1 rounded-md text-xs font-mono font-semibold transition ${
+                window === w
+                  ? "bg-amber-400 text-zinc-950 shadow-sm"
+                  : "text-zinc-400 hover:text-zinc-200"
+              }`}
+            >
+              {w}
+            </button>
+          ))}
+        </div>
+      </div>
+
       {/* Configurable Rules Card */}
       <div className="rounded-xl border border-zinc-800 bg-zinc-900/80 p-3.5">
         <div className="flex items-center justify-between mb-3">
@@ -296,7 +326,7 @@ export function AlertsTab({
 
         {filingAlerts.length === 0 ? (
           <div className="rounded-xl border border-zinc-800/80 bg-zinc-900/40 p-4 text-center text-xs text-zinc-400">
-            No material filings matched the selected categories.
+            No material filings matched the selected categories in the last {window}.
           </div>
         ) : (
           filingAlerts.map((f) => (
