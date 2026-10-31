@@ -709,6 +709,29 @@ def test_results_takeaway_rules() -> None:
         llm_router._call_gemini_json_with_model = orig
 
 
+def test_management_bio_is_facts_only() -> None:
+    info = {"person_name": "Noel N Tata", "role": "Chairman and Director", "action": "Retirement",
+            "effective_date": "11th November 2026"}
+    puffery = ("Noel N. Tata, Chairman and Director of Trent Limited, is set to retire on November 11, 2026.\n"
+               "He has been associated with the company since 1997, providing exemplary leadership and driving "
+               "significant growth and market position.")
+    plain = "Noel N Tata retires as Chairman and Director on 11th November 2026, having joined the board in 1997."
+    prompts = []
+    orig = {k: getattr(llm_router, k) for k in ("_call_gemini_json", "_search_executive_web", "_call_gemini_json_with_model")}
+    try:
+        llm_router._call_gemini_json = lambda **kw: info
+        llm_router._search_executive_web = lambda *a: []
+        llm_router._call_gemini_json_with_model = lambda **kw: (prompts.append(kw["prompt"]), ({**info, "two_line_bio": puffery}, "flash"))[1]
+        out = llm_router.enrich_management_change("TRENT", "Trent Limited", "Retirement of Mr. Noel N Tata")
+        assert out["two_line_bio"] == "Noel N Tata: Retirement as Chairman and Director, effective 11th November 2026.", out
+        llm_router._call_gemini_json_with_model = lambda **kw: ({**info, "two_line_bio": plain}, "flash")
+        assert llm_router.enrich_management_change("TRENT", "Trent Limited", "t")["two_line_bio"] == plain
+    finally:
+        for k, v in orig.items():
+            setattr(llm_router, k, v)
+    assert "No praise" in prompts[0] and "exemplary" in prompts[0], prompts[0]
+
+
 def test_results_screener_quarter_gate() -> None:
     orig_fetch = llm_router.fetch_screener_fundamentals
     try:

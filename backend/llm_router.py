@@ -864,6 +864,24 @@ def _search_executive_web(person_name: str, company_name: str) -> list[dict[str,
     return snippets
 
 
+# Praise / impact words a management-change bio may not use (the TRENT card said "exemplary leadership ... significant growth")
+_PRAISE_WORDS = re.compile(
+    r"\b(exemplary|visionary|veteran|seasoned|experienced|extensive|distinguished|eminent|illustrious|renowned|"
+    r"stellar|outstanding|remarkable|exceptional|strong|robust|significant(ly)?|instrumental|credited|pivotal|"
+    r"dynamic|accomplished|esteemed|rich experience)\b",
+    re.IGNORECASE,
+)
+
+
+def _factual_mgmt_bio(info: dict[str, Any]) -> str:
+    """'Noel N Tata: Retirement as Chairman, effective 11th November 2026.' from the extracted fields only."""
+    who = (info.get("person_name") or "Unknown").strip()
+    action = (info.get("action") or "Management change").strip()
+    role = (info.get("role") or "").strip()
+    date = (info.get("effective_date") or "").strip()
+    return f"{who}: {action}{f' as {role}' if role else ''}{f', effective {date}' if date else ''}."
+
+
 def enrich_management_change(
     ticker: str,
     company_name: str,
@@ -916,13 +934,16 @@ Extracted Filing Info:
 Web Search Snippets (DuckDuckGo):
 {json.dumps(web_results, ensure_ascii=False)}
 
-Write a factual, grounded executive summary. Do NOT make up or guess career history if neither the filing nor search results mention it.
+Write a plain factual record of the change, like a filing register entry.
+Rules:
+- State only facts given in the Extracted Filing Info: who, their role, what changed, the effective date, and the stated reason or tenure. Add prior roles, employers or education only if the filing info or a snippet clearly about this same person names them. Never guess.
+- No praise, judgment or impact claims: do not rate their leadership or credit them with growth. Never use words such as exemplary, visionary, veteran, seasoned, experienced, extensive, distinguished, eminent, strong, significant, instrumental or "credited with".
 Return a JSON object with:
 - "person_name": "{person_name}"
 - "role": "{role}"
 - "action": "{action}"
 - "effective_date": "{info.get('effective_date', '')}"
-- "two_line_bio": A sharp 2-line background/bio covering who they are, where they came from (previous companies/roles/education), or the context of their departure.
+- "two_line_bio": At most 2 short sentences following the rules above.
 - "source_url": Best reference URL from the search snippets (e.g. LinkedIn or profile page), or "" if only from the exchange filing.
 """
     enriched, served_by = _call_gemini_json_with_model(
@@ -934,7 +955,13 @@ Return a JSON object with:
     )
     if isinstance(enriched, list):
         enriched = enriched[0] if enriched and isinstance(enriched[0], dict) else {}
-    return {**enriched, "model": served_by} if isinstance(enriched, dict) else {}
+    if not isinstance(enriched, dict):
+        return {}
+    if _PRAISE_WORDS.search(enriched.get("two_line_bio") or ""):
+        # The model ignored the rules: keep only the extracted facts
+        logger.info("[llm] management bio for %s had praise words, using the filing facts", ticker)
+        enriched["two_line_bio"] = _factual_mgmt_bio({**info, **enriched})
+    return {**enriched, "model": served_by}
 
 
 def call_gemini_pro_json(
