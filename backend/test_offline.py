@@ -791,6 +791,10 @@ def test_classifier_rules() -> None:
         "Outcome of Board Meeting: approved financial results for Q2 FY27 and corporate guarantee for wholly owned subsidiary": ("results", 1),
         "Board approved interim dividend of Rs 5 and issue of corporate guarantee for subsidiary": ("dividend", 1),
         "Acquisition of 100% stake in ABC; corporate guarantee to subsidiary": ("M&A", 1),
+        # Investing in a subsidiary is M&A per ENAM, even with a guarantee for it in the same filing
+        "Investment in wholly owned subsidiary and corporate guarantee": ("M&A", 1),
+        "Outcome of Board Meeting: approval for investment in and corporate guarantee to wholly owned subsidiary": ("M&A", 1),
+        "Capital infusion into subsidiary and corporate guarantee": ("M&A", 1),
         "Post Earnings Conference Call of the Company is scheduled on October 28, 2026": ("earnings_call", 1),
         "Show cause notice received from the GST department": ("litigation", 1),
         "SEBI levied a fine of ₹5 lakh on the Company": ("litigation", 1),
@@ -831,6 +835,7 @@ def test_classifier_rules() -> None:
         assert got == want, (desc, got, want)
     cfo = "Outcome of Board Meeting: appointment of Mr. A as CFO and appointment of internal auditors"
     assert enforce_filing_hygiene(cfo, "management_change", 1) == ("management_change", 1)
+    assert enforce_filing_hygiene("Investment in wholly owned subsidiary and corporate guarantee", "M&A", 1) == ("M&A", 1)
     # Subsidiary IPO filings misread as results are fund raises; matched as whole words ("offering" via offer\w*)
     assert enforce_filing_hygiene("Results of Jio Platforms initial public offering", "results", 1) == ("fund_raise", 1)
 

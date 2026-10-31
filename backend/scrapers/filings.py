@@ -28,7 +28,7 @@ def _wb_any(phrases: list[str]) -> re.Pattern[str]:
 # First match wins. Stems end in \w* because matching is whole-word.
 CATEGORY_RULES: list[tuple[re.Pattern[str], str, int]] = [
     (_wb(r"financial results?|un-?audited|audited|outcome of board meeting.*results?|investor presentation.*q[1-4]|earnings?(?! call| conference)"), "results", 1),
-    (_wb(r"acqui\w*|mergers?|demergers?|amalgamation|joint ventures?|stakes?|subsidiar(?:y|ies)|incorporation|slump sale"), "M&A", 1),
+    (_wb(r"acqui\w*|mergers?|demergers?|amalgamation|joint ventures?|stakes?|subsidiar(?:y|ies)|incorporation|slump sale|invest(?:ment|ing)? in(?:to)?|(?:capital|equity) infusion|infus\w* (?:into|in)"), "M&A", 1),
     (_wb(r"qip|qualified institution\w*|preferential|rights issue|buy-?back|allotment of .*debentures?|non[- ]convertible|ncds?|commercial paper|fund rais\w*"), "fund_raise", 1),
     # No bare "board of directors": board meeting intimations name the board without any change in it
     (_wb(r"resign\w*|appoint\w*|cessation|retire\w*|managing director|ceo|cfo|whole-?time director|key managerial|change in (?:the )?(?:directors?|management|kmp)"), "management_change", 1),
