@@ -732,6 +732,30 @@ def test_management_bio_is_facts_only() -> None:
     assert "No praise" in prompts[0] and "exemplary" in prompts[0], prompts[0]
 
 
+def test_management_person_follows_title() -> None:
+    # The real TRENT bug: the Rajiv Dube appointment PDF names Noel Tata first, and the extract picked him
+    title = ("Appointment: Trent Limited has informed the Exchange regarding Appointment of Mr Rajiv Dube as "
+             "Non- Executive Director of the company w.e.f. October 30, 2026.")
+    assert llm_router._title_person_info(title) == {
+        "person_name": "Rajiv Dube", "role": "Non-Executive Director", "action": "Appointment",
+        "effective_date": "October 30, 2026", "filing_profile_notes": ""}
+    assert llm_router._title_person_mismatch("Retirement of Mr. Noel N Tata as the Chairman", "Noel N. Tata") == {}
+    assert llm_router._title_person_mismatch("Change in Director(s) of the company.", "Noel N. Tata") == {}
+    assert llm_router._title_person_info("Dr. Reddy's Laboratories Limited has informed the Exchange") == {}
+    prompts = []
+    orig = {k: getattr(llm_router, k) for k in ("_call_gemini_json", "_search_executive_web", "_call_gemini_json_with_model")}
+    try:
+        llm_router._call_gemini_json = lambda **kw: {"person_name": "Noel N. Tata", "action": "Retirement",
+                                                      "filing_profile_notes": "associated since 1997"}
+        llm_router._search_executive_web = lambda *a: []
+        llm_router._call_gemini_json_with_model = lambda **kw: (prompts.append(kw["prompt"]), ({"two_line_bio": "x"}, "flash"))[1]
+        llm_router.enrich_management_change("TRENT", "Trent Limited", title)
+    finally:
+        for k, v in orig.items():
+            setattr(llm_router, k, v)
+    assert '"person_name": "Rajiv Dube"' in prompts[0] and "Noel" not in prompts[0] and "1997" not in prompts[0], prompts[0]
+
+
 def test_results_screener_quarter_gate() -> None:
     orig_fetch = llm_router.fetch_screener_fundamentals
     try:

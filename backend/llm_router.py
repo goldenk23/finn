@@ -882,6 +882,36 @@ def _factual_mgmt_bio(info: dict[str, Any]) -> str:
     return f"{who}: {action}{f' as {role}' if role else ''}{f', effective {date}' if date else ''}."
 
 
+_TITLE_PERSON_RE = re.compile(r"\b(?:Mr|Mrs|Ms|Miss|Dr|Shri|Smt|Prof)\.?\s+((?:[A-Z][\w.'’]*\s?)+)")
+
+
+def _title_person_info(filing_title: str) -> dict[str, str]:
+    """Facts from a title that names someone, e.g. 'Appointment of Mr Rajiv Dube as Non- Executive Director ... w.e.f. October 30, 2026.'"""
+    # skip "Dr. Reddy's Laboratories Limited": a company, not a person
+    m = next((m for m in _TITLE_PERSON_RE.finditer(filing_title or "") if not re.search(r"\b(Limited|Ltd)\b", m.group(1))), None)
+    if not m:
+        return {}
+    rest = re.sub(r"-\s+", "-", filing_title[m.end():])
+    role = re.match(r"\s*(?:-\s*)?as (?:an? |the )?(.+?)(?= of the [Cc]ompany| w\.e\.f| on |[,(]|\.?$)", rest)
+    date = re.search(r"w\.e\.f\.?\s*([A-Z][a-z]+ \d{1,2}, \d{4})", filing_title)
+    prefix = filing_title.split(":", 1)[0].strip()
+    return {
+        "person_name": m.group(1).strip(),
+        "role": role.group(1).strip() if role else "",
+        "action": prefix if ":" in filing_title and len(prefix.split()) <= 2 else "Change in Directorate",
+        "effective_date": date.group(1) if date else "",
+        "filing_profile_notes": "",
+    }
+
+
+def _title_person_mismatch(filing_title: str, person_name: str) -> dict[str, str]:
+    """The title's facts if the title names someone whose surname is not in `person_name`, else {}."""
+    titled = _title_person_info(filing_title)
+    if titled and titled["person_name"].split()[-1].strip(".").lower() not in (person_name or "").lower():
+        return titled
+    return {}
+
+
 def enrich_management_change(
     ticker: str,
     company_name: str,
@@ -903,6 +933,7 @@ Filing Text:
 {pdf_text[:10000]}
 
 Return a JSON object with:
+If the Filing Title names a person, that person is the subject: report only their change, even when the filing text describes other directors first.
 - "person_name": Full name of the primary person joining, resigning, or changing role (or "Unknown" if not named)
 - "role": Their designation/role (e.g., "Chief Financial Officer", "Independent Director", "Managing Director")
 - "action": One of ["Appointment", "Resignation", "Retirement", "Re-appointment", "Change in Directorate"]
@@ -920,6 +951,10 @@ Return a JSON object with:
         info = info[0] if info and isinstance(info[0], dict) else {}
     elif not isinstance(info, dict):
         info = {}
+    if titled := _title_person_mismatch(filing_title, info.get("person_name") or ""):
+        # A board-outcome PDF names several directors; the extract picked someone other than the title's person
+        logger.info("[llm] %s mgmt extract named %r, title names %r: using the title", ticker, info.get("person_name"), titled["person_name"])
+        info = titled
     person_name = (info.get("person_name") or "Unknown").strip()
     role = (info.get("role") or "").strip()
     action = (info.get("action") or "Management Change").strip()

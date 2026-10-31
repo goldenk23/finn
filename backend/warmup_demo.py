@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.stdout.reconfigure(encoding="utf-8")
 
 from backend.db import get_conn, get_portfolio, init_db, normalize_ticker
-from backend.llm_router import _PRAISE_WORDS, get_cost_summary
+from backend.llm_router import _PRAISE_WORDS, _title_person_mismatch, get_cost_summary
 from backend.pull_engine import (
     _SOURCE_AMOUNT_RE,
     _quarters_without_prior_call,
@@ -98,6 +98,8 @@ def card_problem(row, reenrich: bool) -> str:
             return "old results format"
     elif not enr.get("two_line_bio") or _PRAISE_WORDS.search(enr["two_line_bio"]):
         return "missing or praise-worded bio"
+    elif _title_person_mismatch(row["title"] or "", enr.get("person_name") or ""):
+        return "person differs from the one the title names"
     return ""
 
 
