@@ -24,6 +24,12 @@ http://13.233.140.42, :80 {
 	}
 }
 https://13.233.140.42 {
+	tls {
+		key_type rsa2048
+		issuer acme {
+			profile shortlived
+		}
+	}
 	encode zstd gzip
 
 	reverse_proxy finn:8000 {
