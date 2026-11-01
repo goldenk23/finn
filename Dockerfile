@@ -11,13 +11,14 @@ RUN FINN_STATIC_EXPORT=1 npx next build
 
 # --- Stage 2: Python runtime ---
 FROM python:3.13-slim
-# FINN_PROXY_HOPS=1: the platform load balancer appends the real client IP to X-Forwarded-For (verify per platform).
+# FINN_PROXY_HOPS=1: Caddy / load balancer appends the real client IP to X-Forwarded-For.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     FINN_PROXY_HOPS=1
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
 
@@ -28,5 +29,7 @@ COPY --from=web --chown=finn:finn /app/frontend/out frontend/out
 USER finn
 
 EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:${PORT:-8000}/api/health || exit 1
 # Secrets (GEMINI_API_KEY, FINN_ADMIN_TOKEN) come from the platform's env settings, never from the image.
-CMD ["sh", "-c", "exec uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "exec uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8000} --timeout-keep-alive 75"]

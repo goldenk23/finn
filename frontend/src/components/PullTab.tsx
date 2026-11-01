@@ -813,6 +813,17 @@ export function PullTab({
   } | null>(null);
   const askReqIdRef = useRef<number>(0);
   const askAbortRef = useRef<AbortController | null>(null);
+  const promptRef = useRef<HTMLTextAreaElement | null>(null);
+
+  function syncPromptHeight(el: HTMLTextAreaElement | null) {
+    if (!el) return;
+    el.style.height = "auto";
+    if (el.value) el.style.height = `${Math.min(el.scrollHeight + 2, 176)}px`;
+  }
+
+  useEffect(() => {
+    syncPromptHeight(promptRef.current);
+  }, [question, pullData?.ticker]);
   const [rerunning, setRerunning] = useState(false);
   const [rerunError, setRerunError] = useState<string | null>(null);
   const activeTickerRef = useRef(activeTicker);
@@ -1358,14 +1369,24 @@ export function PullTab({
                 e.preventDefault();
                 handleAskQuestion(question);
               }}
-              className="mt-3 flex items-center gap-2"
+              className="mt-3 flex items-end gap-2"
             >
-              <input
-                type="text"
+              <textarea
+                ref={promptRef}
+                rows={1}
                 value={question}
-                onChange={(e) => setQuestion(e.target.value)}
+                onChange={(e) => {
+                  setQuestion(e.target.value);
+                  syncPromptHeight(e.currentTarget);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    handleAskQuestion(question);
+                  }
+                }}
                 placeholder={`Ask about ${pullData.ticker}...`}
-                className="flex-1 rounded-lg border border-cyan-500/35 bg-zinc-950/95 px-3 min-h-11 text-base text-white placeholder-zinc-400 focus:border-cyan-400 focus:outline-none shadow-inner"
+                className="flex-1 rounded-lg border border-cyan-500/35 bg-zinc-950/95 px-3 py-2.5 min-h-11 max-h-44 overflow-y-auto resize-y leading-snug text-base text-white placeholder-zinc-400 focus:border-cyan-400 focus:outline-none shadow-inner"
               />
               <button
                 type="submit"

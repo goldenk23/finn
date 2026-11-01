@@ -1,0 +1,44 @@
+# Production EC2 stack: Caddy reverse proxy + FINN single-origin container.
+# Usage on EC2:
+#   cp .env.example .env   # set GEMINI_API_KEY (and optional FINN_DOMAIN)
+#   docker compose up -d --build
+
+services:
+  finn:
+    build: .
+    container_name: finn-app
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - PORT=8000
+      - FINN_PROXY_HOPS=1
+    expose:
+      - "8000"
+    volumes:
+      # Persist downloaded filing/AR PDFs across container rebuilds
+      - finn_pdf_cache:/app/backend/cache_pdfs
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: finn-caddy
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # Defaults to ":80" (works directly on raw EC2 IP).
+      # Set FINN_DOMAIN=finn.yourdomain.com (or <EC2-IP>.sslip.io) in .env for automatic Let's Encrypt HTTPS.
+      - FINN_DOMAIN=${FINN_DOMAIN:-:80}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      finn:
+        condition: service_healthy
+
+volumes:
+  finn_pdf_cache:
+  caddy_data:
+  caddy_config:

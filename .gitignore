@@ -18,8 +18,11 @@ venv/
 # PDF & Scraper Caches
 backend/cache_pdfs/
 
-# Local dev server logs
+# Local dev server logs & scratch
 .runtime/
+.agents/
+tmp/
+*.log
 
 # Next.js / Node
 node_modules/

@@ -1,100 +1,141 @@
-# FINN — Institutional Financial Investment Agent (NSE / BSE)
+# FINN: Financial Investment Agent (NSE)
 
-**FINN** is a mobile-first equity intelligence agent built for Indian public-markets investors (ENAM Holdings AI Engineer Build Challenge). It operates in two complementary modes—**Push (Proactive Signal Triage & Anomaly Alerts)** and **Pull (On-Demand Primary-Source Deep Research)**—grounded strictly in exchange filings, 10Y financial statements, concall transcripts, investor presentations, and annual reports.
+FINN is a mobile-first web app I built for the ENAM Holdings AI Engineer Build Challenge. It has two modes:
 
----
+- **Push:** a daily triage of exchange filings for a portfolio. Material events come first, routine paperwork is collapsed, duplicates are merged, and results and management changes get their own cards. Price, volume and filing alerts are checked against thresholds you set.
+- **Pull:** an on-demand research report on any NSE company Screener covers, built from its Annual Report, recent concall transcripts and Screener's tables, plus a Copilot for follow-up questions.
 
-## Quick Start (Local Demo)
+[COVERING_NOTE.md](COVERING_NOTE.md) explains the choices, real costs and what I left out. [ARCHITECTURE.md](ARCHITECTURE.md) explains how each part works, with file and line references.
 
-The repository ships with a pre-warmed SQLite database (`backend/finn.db`) containing **16 NSE portfolio stocks** with live EOD price/volume metrics, **150+ classified NSE/BSE corporate filings** (with deep-enriched Quarterly Results tables and Executive Change biographies), and **4 pre-cached Pull Research reports** (`TRENT`, `KPITTECH`, `DIXON`, `POLYCAB`) that load in **<15ms at $0.00 marginal cost**.
+## What's in the demo database
 
-### 1. Environment Setup
-Create a `.env` file in the project root (see `.env.example`):
+`backend/finn.db` is committed and already filled, so the app runs without an API key:
+- 16 portfolio stocks with end-of-day prices
+- 269 announcements, all triaged, with results and management-change cards
+- 21 cached Pull reports, 5 of them for companies outside the portfolio (DIXON, INDHOTEL, PERSISTENT, POLYCAB, WIPRO)
+- alert rules at 3% price move and 2x volume
+
+Cached reports and cards cost nothing to open. You only need Gemini credentials for **Refresh Live**, **Deep Enrich**, **Re-run**, a report for a new ticker, or Copilot questions.
+
+## Setup
+
+You need Python 3.13 (the version in the `Dockerfile`; I developed on 3.13.3) and Node.js with npm for the frontend.
+
+### 1. Environment
+
+Copy `.env.example` to `.env` in the repo root and fill in one of the two Gemini options:
+
 ```ini
-# Option A: Standard Gemini API Key
-GEMINI_API_KEY=your_gemini_api_key
+# Option 1: Gemini Developer API key
+GEMINI_API_KEY=your_api_key_here
 
-# Option B: Google Cloud Vertex AI (Application Default Credentials)
-GOOGLE_GENAI_USE_VERTEXAI=true
-GOOGLE_CLOUD_PROJECT=your_gcp_project_id
-GOOGLE_CLOUD_LOCATION=global
+# Option 2: Vertex AI with Application Default Credentials (gcloud auth application-default login)
+# GOOGLE_GENAI_USE_VERTEXAI=true
+# GOOGLE_CLOUD_PROJECT=your_gcp_project_id
+# GOOGLE_CLOUD_LOCATION=global
 ```
 
-### 2. Start the FastAPI Backend (`:8000`)
+Optional settings, all from `.env.example`:
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `FINN_DAILY_BUDGET_USD` | `5.00` | Paid endpoints return 429 once today's (UTC) spend in `llm_cost_ledger` reaches this |
+| `FINN_ADMIN_TOKEN` | unset | If set, `?force=true`, `/api/push/refresh` and `/api/push/enrich` need an `X-Admin-Token` header. The UI doesn't send it, so leave it unset locally or those buttons get 401 |
+| `FINN_REFRESH_MINUTES` | unset (off) | Run a Push refresh (prices, filings, triage, up to 6 cards; this makes paid LLM calls) every N minutes while the server runs. Use one uvicorn worker, since each worker starts its own loop |
+| `FINN_PROXY_HOPS` | `0` (`1` in the Docker image) | How many trusted proxies add to `X-Forwarded-For`, for the per-IP rate limit |
+| `FINN_CORS_ORIGINS` | `*` | Only needed if the frontend is served from another origin |
+| `NEXT_PUBLIC_API_URL` | empty (same origin) | Backend URL for the browser and the dev proxy |
+
+### 2. Backend (port 8000)
+
 ```bash
 pip install -r requirements.txt
-python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
+python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
 ```
 
-### 3. Start the Next.js Mobile UI (`:3000`)
+Add `--reload` while editing code. Check it with `http://127.0.0.1:8000/api/health`.
+
+### 3. Frontend (port 3000)
+
+The scripts come from `frontend/package.json`:
+
 ```bash
 cd frontend
-npm install
-npm run dev
+npm ci            # or npm install
+npm run dev       # next dev on http://localhost:3000
 ```
-Open **`http://localhost:3000`** in your browser. Next.js automatically proxies `/api/*` requests to `http://127.0.0.1:8000/api/*`.
 
----
+The dev server forwards `/api/*` to `http://127.0.0.1:8000` (or `NEXT_PUBLIC_API_URL`), with a 180 s proxy timeout for cold Pull reports (`frontend/next.config.mjs`). For a production build, run `npm run build` and then `npm run start`.
 
-## Core Capabilities
+### 4. One process instead (static export)
 
-### 1. Push Mode — Proactive Digest & Configurable Alerts
-- **Windowed Corporate Digest (`24h` default, `48h`, `7d`, `14d`, `30d`):**
-  - **Noise Filter:** Automatically buries routine exchange paperwork (newspaper advertisements, Regulation 74(5) depository certificates, loss of share certificates, trading window closures, routine analyst meet schedule notices) behind a single collapsible counter while surfacing high-conviction material signals at the top.
-  - **Event Deduplication:** Collapses duplicate exchange announcements for the same stock and event (e.g., dual resignation intimations or board outcome + auditor report filings) into a single canonical card.
-  - **Hero Card — Quarterly Results (`results`):** Extracts Consolidated **Revenue, EBITDA, PBT, and PAT** (`₹ Cr`) with color-coded **QoQ %** and **YoY %** delta pills, cross-checked against Screener's standardized quarterly table to prevent PDF unit-conversion errors.
-  - **Hero Card — Executive Changes (`management_change`):** Extracts executive name, designation, action badge (`Appointment` / `Resignation`), and synthesizes a grounded **2-line background/bio** from the exchange PDF and DuckDuckGo web search (`ddgs`).
-- **Configurable Threshold Alerts:**
-  - Interactive sliders for **EOD Price Move (`±X%`)** and **Volume Spike (`Yx 20d avg`)** plus toggleable **Watched Material Categories** (`results`, `M&A`, `management_change`, `fund_raise`, `litigation`, `capex`, etc.) that persist to SQLite and re-evaluate portfolio anomalies live.
+FastAPI serves the frontend itself if `frontend/out` exists (`backend/main.py:524-526`):
 
-### 2. Pull Mode — On-Demand Primary-Source Deep Research
-Works on **any NSE/BSE ticker** (portfolio stocks + ad-hoc search for any listed company such as `DIXON`, `POLYCAB`, `INDHOTEL`, `PERSISTENT`):
-- **Hero Worked Example — Narrative vs. Numbers (4-Quarter Audit):**
-  - Audits management's stated guidance, margin expectations, and expansion promises from recent Concall Transcripts / Investor Presentations / Annual Reports against actual reported Revenue, OPM %, and PAT across the last 4 quarters, assigning a `Beat`, `Delivered`, `Mixed`, or `Missed` verdict and analytical note per quarter.
-- **8 Structured Institutional Modules:**
-  1. `narrative_vs_numbers` (4-Quarter Guidance vs. Delivery Audit)
-  2. `financial_snapshot` (8-KPI institutional grid + valuation vs. ROCE/ROE read)
-  3. `business_snapshot` (Core business model, vertical revenue mix, key operating levers)
-  4. `trajectory` (6-Quarter & 5-Year Revenue, PAT & OPM % charts + expanding vs. compressing drivers)
-  5. `cash_quality` (CFO vs. PAT conversion badge + multi-year comparative chart)
-  6. `balance_sheet` (Leverage posture, Borrowings, Reserves, D/E, Working Capital & Cash Conversion Cycle days, with specialized **Banking/NBFC domain rules** for `HDFCBANK` / `BAJFINANCE`)
-  7. `guidance` (Management tone badge + stated forward targets with source tags)
-  8. `bull_vs_bear` (3 number-backed Bull arguments vs. 3 Bear/Risk arguments)
-- **Primary-Source Copilot Q&A (`POST /api/pull/{ticker}/ask`):**
-  - Interactive Q&A grounded strictly in the company's primary financial tables and extracted filing text, returning number-cited answers and source tags.
+PowerShell:
 
-### 3. 3-Tier Gemini Model Routing & Cost Telemetry
-Click the **`$0.XXX • 3-Tier`** pill in the top header to inspect live token consumption and USD spend across workflows:
-- **Tier 1 (`gemini-2.5-flash-lite` — `$0.10 / 1M`):** Bulk classification & 1-line digest generation across 17 filing categories.
-- **Tier 2 (`gemini-2.5-flash` — `$0.30 / 1M`):** PDF results extraction, executive bio synthesis, Concall Map distillation, and interactive Copilot Q&A.
-- **Tier 3 (`gemini-2.5-pro` — `$1.25 / 1M`):** Reserved strictly for the 8-module Pull synthesis and 4-Quarter Narrative vs. Numbers audit.
+```powershell
+cd frontend
+$env:FINN_STATIC_EXPORT = "1"
+npx next build
+cd ..
+python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
+```
 
----
+In bash, the build line is `FINN_STATIC_EXPORT=1 npx next build`.
 
-## Repository Structure
+Then open `http://127.0.0.1:8000`.
+
+### 5. Docker & AWS EC2 Deployment
+
+The `Dockerfile` builds the static frontend and runs everything in one container on `$PORT` (default 8000). The demo database is copied into the image.
+
+```bash
+docker build -t finn .
+docker run --rm -p 8000:8000 --env-file .env finn
+```
+
+For AWS EC2 production deployment, `docker-compose.yml` pairs the app container (`restart: always`, `/api/health` healthcheck) with a **Caddy** reverse proxy (`Caddyfile`, 180 s upstream timeout for cold Pull synthesis, automatic Let's Encrypt HTTPS when `FINN_DOMAIN` is set):
+
+```bash
+cp .env.example .env      # fill in GEMINI_API_KEY (and optional FINN_DOMAIN)
+docker compose up -d --build
+```
+
+## Tests and scripts
+
+```bash
+python backend/test_offline.py
+```
+
+This runs the offline suite: no network, no LLM calls, and it never writes `finn.db`. It prints `34 offline test(s) passed`.
+
+`backend/test_plumbing.py`, `backend/test_push.py` and `backend/test_pull.py` are live smoke tests. They scrape NSE and Screener, some call Gemini (paid), and they write to `finn.db`. Don't run them unless you mean to.
+
+`backend/warmup_demo.py` rebuilds the demo data with the current code. Start with `python backend/warmup_demo.py --dry-run`, which prints the plan and makes no LLM calls. The full run makes paid calls and stops once the ledger total reaches `--stop-at-usd` (default 4.50).
+
+## Repository layout
 
 ```text
-├── ARCHITECTURE.md            # System architecture diagram, Push/Pull sequence flows & EC2 capacity math
-├── COVERING_NOTE.md           # Design choices, model routing trade-offs, what we skipped & roadmap
-├── FRONTEND_CONTEXT.md        # API contract reference & frontend handoff specification
-├── requirements.txt           # Python backend dependencies
+├── README.md, COVERING_NOTE.md, ARCHITECTURE.md
+├── docs/diagrams/            # architecture PNGs + Mermaid sources (render_diagrams.py)
+├── Dockerfile, docker-compose.yml, Caddyfile, .dockerignore, .env.example, requirements.txt
 ├── backend/
-│   ├── main.py                # FastAPI server & REST endpoints (/api/push, /api/pull, /api/portfolio, /api/cost)
-│   ├── db.py                  # SQLite (WAL mode) schema, 16-stock seed & alert rules
-│   ├── llm_router.py          # 3-Tier Vertex AI / Gemini router, cost ledger & results sanity checker
-│   ├── push_engine.py         # Filing hygiene, event deduplication, digest & anomaly evaluation
-│   ├── pull_engine.py         # Map-Reduce primary-source synthesis, Bank/NBFC rules & Copilot Q&A
-│   ├── pdf_utils.py           # SHA256 content-addressed PDF cache & PyMuPDF keyword page extractor
-│   ├── warmup_demo.py         # Portfolio EOD, filing hygiene & Pull cache pre-warming script
-│   └── scrapers/
-│       ├── market_data.py     # yfinance EOD price, 1D % change & 20d volume ratio fetcher
-│       ├── filings.py         # NSE & BSE corporate announcements scraper + hygiene rules
-│       └── screener.py        # Screener.in 10Y consolidated financials, Concall & AR link scraper
+│   ├── main.py               # FastAPI routes, budget cap, rate limits, admin token, background refresh
+│   ├── db.py                 # SQLite schema (WAL), 16-stock seed, ticker renames
+│   ├── llm_router.py         # model tiers, fallbacks, price table, cost ledger, results and management cards
+│   ├── push_engine.py        # refresh, triage, enrichment, digest, dedup, alerts
+│   ├── pull_engine.py        # Pull report (map + reduce), unit checks, staleness, Copilot
+│   ├── pdf_utils.py          # PDF download + cache, keyword page selection
+│   ├── warmup_demo.py        # rebuilds the demo data
+│   ├── test_offline.py       # offline test suite
+│   ├── test_plumbing.py, test_push.py, test_pull.py   # live smoke tests
+│   ├── finn.db               # committed demo database
+│   └── scrapers/             # filings.py (NSE/BSE), market_data.py (yfinance), screener.py
 └── frontend/
+    ├── next.config.mjs, package.json, tailwind.config.ts
     └── src/
-        ├── app/               # Next.js 14 App Router shell (max-w-[430px] institutional mobile frame)
-        ├── components/        # PushTab, FilingCard, AlertsTab, PullTab, PortfolioTab, CostDrawer
-        ├── lib/api.ts         # Typed FastAPI client
-        └── types/finn.ts      # End-to-end TypeScript interfaces
+        ├── app/              # layout.tsx, page.tsx (tabs, polling, unseen alerts)
+        ├── components/       # PushTab, FilingCard, AlertsTab, PullTab, PortfolioTab, CostDrawer
+        ├── lib/api.ts        # API client
+        └── types/finn.ts     # response types
 ```
-

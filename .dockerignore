@@ -26,4 +26,6 @@ frontend/out
 *.md
 docs
 Dockerfile
+docker-compose.yml
+Caddyfile
 .dockerignore
