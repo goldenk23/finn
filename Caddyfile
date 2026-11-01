@@ -1,4 +1,7 @@
 {$FINN_DOMAIN::80} {
+	tls {
+		key_type rsa2048
+	}
 	encode zstd gzip
 
 	reverse_proxy finn:8000 {
