@@ -12,7 +12,18 @@
 		}
 	}
 }
-:80 {
+http://13.233.140.42, :80 {
+	encode zstd gzip
+
+	reverse_proxy finn:8000 {
+		transport http {
+			read_timeout 180s
+			write_timeout 180s
+			response_header_timeout 180s
+		}
+	}
+}
+https://13.233.140.42 {
 	encode zstd gzip
 
 	reverse_proxy finn:8000 {
