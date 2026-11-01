@@ -1,3 +1,7 @@
+{
+	default_sni 13.233.140.42
+}
+
 {$FINN_DOMAIN::80} {
 	tls {
 		key_type rsa2048
