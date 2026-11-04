@@ -5,7 +5,7 @@ FINN is a mobile-first web app I built for the ENAM Holdings AI Engineer Build C
 - **Push:** a daily triage of exchange filings for a portfolio. Material events come first, routine paperwork is collapsed, duplicates are merged, and results and management changes get their own cards. Price, volume and filing alerts are checked against thresholds you set.
 - **Pull:** an on-demand research report on any NSE company Screener covers, built from its Annual Report, recent concall transcripts and Screener's tables, plus a Copilot for follow-up questions.
 
-[COVERING_NOTE.md](COVERING_NOTE.md) explains the choices, real costs and what I left out. [ARCHITECTURE.md](ARCHITECTURE.md) explains how each part works, with file and line references.
+[COVERING_NOTE.md](COVERING_NOTE.md) explains the choices, real costs and what I left out. [ARCHITECTURE.md](ARCHITECTURE.md) explains how each part works, with file and line references. [docs/ai-build-history/](docs/ai-build-history/) contains the complete AI coding-agent conversation transcripts (`chat1.md`–`chat4.md`).
 
 ## What's in the demo database
 
