@@ -118,8 +118,12 @@ def _get_client() -> genai.Client:
     location = (os.getenv("GOOGLE_CLOUD_LOCATION") or "global").strip()
     use_vertex = (os.getenv("GOOGLE_GENAI_USE_VERTEXAI") or "").lower() == "true"
 
+    # Google Cloud API key on Vertex AI (the server path: no gcloud ADC on EC2, billed to the GCP project's credits)
+    if api_key and use_vertex:
+        return genai.Client(vertexai=True, api_key=api_key)
+
     # Standard Gemini Developer API key (AIza...)
-    if api_key.startswith("AIza") and not use_vertex:
+    if api_key.startswith("AIza"):
         return genai.Client(vertexai=False, api_key=api_key)
 
     # Auto-discover ADC GCP project if GOOGLE_CLOUD_PROJECT is not in os.environ / .env

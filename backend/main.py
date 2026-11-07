@@ -67,9 +67,17 @@ def _friendly_upstream_error(context: str, exc: Exception) -> HTTPException:
             detail="AI authentication failed. Verify GEMINI_API_KEY or Vertex AI credentials (gcloud auth application-default login).",
         )
     if "429" in low or "resource_exhausted" in low or "quota" in low:
+        # "check your plan and billing" = the key's project has no quota for the model (e.g. a free-tier AI Studio key),
+        # which waiting won't fix; anything else is a per-minute/day limit that clears on its own.
+        no_plan = "plan and billing" in low or "billing" in low
         return HTTPException(
             status_code=429,
-            detail="AI rate limit reached. Please wait a moment and try again.",
+            detail=(
+                "Google refused the AI call: this API key's project has no quota for the model. "
+                "Switch the server to a billed key or Vertex AI credentials (see .env.example)."
+                if no_plan
+                else "Google AI rate limit reached. Please wait a minute and try again."
+            ),
         )
     return HTTPException(
         status_code=502,
