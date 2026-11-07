@@ -63,9 +63,9 @@ def main() -> None:
 
     rows = []
     for ip, x in v.items():
-        ua_text = " ".join(x["ua"]).lower()
-        is_bot = any(b in ua_text for b in BOT_UA) or not ua_text.strip() or x["probe"] > x["n"] / 2
-        if is_bot and not args.all:
+        # bot only if every user agent from this IP looks automated, so one curl call doesn't hide a real browser
+        is_bot = all(not u.strip() or any(b in u.lower() for b in BOT_UA) for u in x["ua"]) or x["probe"] > x["n"] / 2
+        if is_bot and not args.all and ip not in args.me:
             continue
         rows.append((x["first"], ip, x, is_bot))
 
