@@ -1,4 +1,5 @@
 """Offline checks: no network, no LLM calls, never writes finn.db. Run with: python backend/test_offline.py"""
+import json
 import logging
 import os
 import sqlite3
@@ -539,6 +540,19 @@ def test_pull_report_staleness() -> None:
             assert rerun["cached"] is False and rerun["stale"] and rerun["screener_lag"], rerun
             cached = pull_engine.get_or_generate_pull_report("ZZLAG", db_path=db)
             assert cached["cached"] is True and cached["screener_lag"] and cached["stale_reason"] == rerun["stale_reason"]
+
+            # A re-run that reads no PDFs must not replace a report that was grounded in filings
+            good = json.dumps({"sources_used": {"documents_parsed": [{"period": "Aug 2026", "doc_type": "Annual Report", "url": "u"}]}})
+            with sqlite3.connect(db) as c:
+                c.execute("INSERT INTO pull_reports_cache (ticker, quarter_key, fundamentals_json, report_json, tokens_in,"
+                          " tokens_out, cost_usd, created_at) VALUES ('ZZGOOD','Jun 2026','{}',?,1,1,0.1,'2026-10-31 00:00:00')", (good,))
+            try:
+                pull_engine.get_or_generate_pull_report("ZZGOOD", force_refresh=True, db_path=db)
+                raise AssertionError("ungrounded re-run should have been refused")
+            except HTTPException as exc:
+                assert exc.status_code == 503, exc
+            with sqlite3.connect(db) as c:
+                assert c.execute("SELECT report_json FROM pull_reports_cache WHERE ticker='ZZGOOD'").fetchone()[0] == good
         finally:
             for k, v in orig.items():
                 setattr(pull_engine, k, v)

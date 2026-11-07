@@ -26,10 +26,15 @@ RUN useradd --create-home --uid 10001 finn
 # backend/ must be writable: SQLite (finn.db + WAL) and the PDF cache live there.
 COPY --chown=finn:finn backend/ backend/
 COPY --from=web --chown=finn:finn /app/frontend/out frontend/out
+# Volume mount points must exist and be owned by finn, or Docker creates them as root and every PDF/DB write fails.
+RUN mkdir -p backend/cache_pdfs /app/data && chown finn:finn backend/cache_pdfs /app/data
 USER finn
+# The live DB lives on the finn_data volume (docker-compose.yml) so rebuilds don't wipe refreshes and the ledger.
+# On first start it is seeded from the pre-warmed backend/finn.db baked into the image.
+ENV FINN_DB_PATH=/app/data/finn.db
 
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -fsS http://127.0.0.1:${PORT:-8000}/api/health || exit 1
 # Secrets (GEMINI_API_KEY, FINN_ADMIN_TOKEN) come from the platform's env settings, never from the image.
-CMD ["sh", "-c", "exec uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8000} --timeout-keep-alive 75"]
+CMD ["sh", "-c", "[ -f \"$FINN_DB_PATH\" ] || cp backend/finn.db \"$FINN_DB_PATH\"; exec uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8000} --timeout-keep-alive 75"]

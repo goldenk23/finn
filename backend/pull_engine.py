@@ -6,6 +6,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from fastapi import HTTPException
+
 from backend.db import get_conn, normalize_ticker, DB_PATH
 from backend.pdf_utils import extract_pdf_text
 from backend.scrapers.screener import fetch_screener_fundamentals
@@ -404,6 +406,18 @@ def get_or_generate_pull_report(
             docs_future = io_pool.submit(_extract_primary_documents, fundamentals, 4)
             material_filings = filings_future.result()
             primary_docs = docs_future.result()
+
+        # A re-run that read no PDFs (download blocked, cache not writable) would replace a grounded report with a
+        # tables-only one. Keep the cached report instead.
+        if force_refresh and not primary_docs:
+            with get_conn(db_path) as conn:
+                prev = conn.execute("SELECT report_json FROM pull_reports_cache WHERE ticker = ?", (clean_ticker,)).fetchone()
+            if prev and (json.loads(prev["report_json"]).get("sources_used") or {}).get("documents_parsed"):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Couldn't download any annual reports or concall transcripts right now, so the existing "
+                    "report was kept. Try again later.",
+                )
 
         # 4. Map Step (Tier 2: gemini-2.5-flash): Distill management promises & commentary per document
         distilled_notes: list[dict[str, Any]] = []

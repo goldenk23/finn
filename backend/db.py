@@ -1,10 +1,12 @@
+import os
 import sqlite3
 import json
 import re
 from pathlib import Path
 from typing import Any
 
-DB_PATH = Path(__file__).parent / "finn.db"
+# FINN_DB_PATH lets Docker keep the DB on a volume; otherwise a rebuild resets it to the image's baked-in copy.
+DB_PATH = Path(os.getenv("FINN_DB_PATH") or Path(__file__).parent / "finn.db")
 
 # Exchange symbol renames (old -> current). NSE, BSE, Screener and yfinance only answer to the new symbols.
 TICKER_RENAMES = {"ZOMATO": "ETERNAL", "TATAMOTORS": "TMPV"}

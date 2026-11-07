@@ -18,6 +18,8 @@ services:
     volumes:
       # Persist downloaded filing/AR PDFs across container rebuilds
       - finn_pdf_cache:/app/backend/cache_pdfs
+      # Persist the SQLite DB (refreshes, reports, cost ledger) across rebuilds; see FINN_DB_PATH in the Dockerfile
+      - finn_data:/app/data
 
   caddy:
     image: caddy:2-alpine
@@ -40,5 +42,7 @@ services:
 
 volumes:
   finn_pdf_cache:
+  finn_data:
   caddy_data:
   caddy_config:
+
