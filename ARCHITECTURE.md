@@ -165,7 +165,7 @@ The reduce prompt has extra rules for lenders: use Financing Margin, don't treat
 `_report_staleness` (`pull_engine.py:244`) reads SQLite only, so it costs nothing. A report is stale when:
 - a new results filing arrived after the report was generated, or
 - the newest filed quarter is later than the report's quarter but Screener's tables haven't caught up (`screener_lag`). A re-run won't help yet, and the banner says so, or
-- the report is older than 7 days (`pull_engine.py:213`).
+- the report is older than one quarter, 90 days (`STALE_AFTER_DAYS` in `pull_engine.py`). This is only a backstop: new quarters are caught by the results-filing check, so a short age limit would flag reports that are still current.
 
 The Pull tab then shows an amber banner with the reason and a re-run button.
 

@@ -210,7 +210,10 @@ def _quarters_without_prior_call(quarter_headers: list[str], concalls: list[dict
     return out
 
 
-STALE_AFTER_DAYS = 7
+# ponytail: age is only a backstop. New quarters are caught by the results-filing check below, so a short age limit
+# just flagged every report a week after a warmup and offered a ~$0.10 re-run that rebuilds the same data.
+# One quarter (~90 days) catches reports that missed a filing because announcements weren't refreshed.
+STALE_AFTER_DAYS = 90
 IST_OFFSET = timedelta(hours=5, minutes=30)  # NSE filing timestamps are IST; cache created_at is SQLite UTC
 _QUARTER_END_MONTHS = {"mar": 3, "jun": 6, "sep": 9, "dec": 12}
 
@@ -281,7 +284,7 @@ def _report_staleness(
             stale_reason=f"{_fiscal_label(latest_q)} results are filed, but Screener's tables still end at {quarter_key}",
         )
     elif generated and now - generated > timedelta(days=STALE_AFTER_DAYS):
-        out.update(stale=True, stale_reason=f"Report is {(now - generated).days} days old (refreshed every {STALE_AFTER_DAYS} days)")
+        out.update(stale=True, stale_reason=f"Report is {(now - generated).days} days old (older than one quarter)")
     return out
 
 

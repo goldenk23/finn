@@ -514,8 +514,10 @@ def test_pull_report_staleness() -> None:
         assert check("ZZNEW", "Sep 2026", "2026-10-29 11:00:00")["stale"] is False
         lag = check("ZZLAG", "Jun 2026", "2026-10-30 09:00:00")
         assert lag["stale"] and lag["screener_lag"] and "Q2 FY27" in lag["stale_reason"] and "Jun 2026" in lag["stale_reason"], lag
-        old = check("ZZOK", "Jun 2026", "2026-10-20 09:00:00")
-        assert old["stale"] and not old["screener_lag"] and "12 days old" in old["stale_reason"], old
+        # a 12-day-old report with no new results filing is still current (the old 7-day rule flagged every report)
+        assert check("ZZOK", "Jun 2026", "2026-10-20 09:00:00")["stale"] is False
+        old = check("ZZNONE", "Jun 2026", "2026-07-20 09:00:00")  # no results rows, so only the age rule can fire
+        assert old["stale"] and not old["screener_lag"] and "104 days old" in old["stale_reason"], old
         assert check("ZZOK", "Jun 2026", "2026-10-30 09:00:00") == {"stale": False, "stale_reason": "", "screener_lag": False}
         assert check("ZZNONE", "Latest", "2026-10-31 09:00:00")["stale"] is False
 
