@@ -2,7 +2,20 @@
 	default_sni 13.233.140.42
 }
 
+# One JSON line per request (time, client IP, method, path, status, user agent) in the caddy_data volume,
+# so it survives restarts and rebuilds. Read it with: sudo python3 scripts/visitors.py
+(access_log) {
+	log {
+		output file /data/access.log {
+			roll_size 20MiB
+			roll_keep 10
+		}
+		format json
+	}
+}
+
 {$FINN_DOMAIN::80} {
+	import access_log
 	tls {
 		key_type rsa2048
 	}
@@ -17,6 +30,7 @@
 	}
 }
 http://13.233.140.42, :80 {
+	import access_log
 	encode zstd gzip
 
 	reverse_proxy finn:8000 {
@@ -28,6 +42,7 @@ http://13.233.140.42, :80 {
 	}
 }
 https://13.233.140.42 {
+	import access_log
 	tls {
 		key_type rsa2048
 		issuer acme {
@@ -44,5 +59,3 @@ https://13.233.140.42 {
 		}
 	}
 }
-
-
